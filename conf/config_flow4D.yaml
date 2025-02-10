@@ -1,0 +1,44 @@
+
+defaults:
+  - _self_
+  - hydra: default
+  - model: flow4D
+  
+slurm_id: debug #more_point_offset_noise_directly_restorepoint_multiframe_freeze
+
+wandb_mode: online # [offline, disabled, online]
+wandb_project_name: Flow4D
+dataset_path: /data1/dataset/av2/multi_frame_idx/sensor
+
+output: ${model.name}-${slurm_id}
+
+checkpoint: /data0/code/Flow4D_diff_less_to_more/logs/jobs/flow4D-more_point_offset_noise_directly_restorepoint_multiframe_freeze/02-08-18-16/checkpoints/03__0.705_0.014_0.095_0.259_0.003_0.022_0.51.ckpt
+pretrained_weights: /data0/code/Flow4D_diff_less_to_more/checkpoints/multi5/06__0.131_0.009_0.019_0.043_0.004_0.010_0.88.ckpt
+eval_only: False
+
+# trainer
+num_workers: 12
+gpus: 1 # will change in code: torch.cuda.device_count()
+sync_bn: true
+batch_size: 1
+epochs: 50
+gradient_clip_val: 5.0
+debug: False
+
+version: 2024
+
+lr: 1e-3
+loss_fn: deflowLoss # choices: [ff3dLoss, zeroflowLoss, deflowLoss, weigthedflowLoss]
+semantic_loss: False
+
+# log settings
+seed: 42069
+log_every: 10 # steps epochs*dataset_size/batch_size
+val_every: 1 # epochs
+save_top_model: 10 # top_k model will be saved.
+
+# -----> Model and Task Parameters
+voxel_size: [0.2, 0.2, 0.2]
+point_cloud_range: [-51.2, -51.2, -2.2, 51.2, 51.2, 4.2]
+variation: 1
+num_frames: 2 

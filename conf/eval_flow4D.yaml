@@ -1,0 +1,23 @@
+defaults:
+  - _self_
+  - hydra: default
+  - model: flow4D
+  
+slurm_id: debug #val_croco_finetune
+
+wandb_mode: online # [offline, disabled, online]
+dataset_path: /data1/dataset/av2/preprocess/sensor
+
+output: ${model.name}-${slurm_id}
+
+checkpoint: /data0/code/Flow4D_diff_less_to_more/logs/jobs/flow4D-more_point_backbonefeature_freeze/01-24-00-12/checkpoints/09__0.187_0.011_0.025_0.058_0.004_0.014_0.72.ckpt #/data0/code/Flow4D_croco/logs/jobs/flow4D-croco_finetune/01-06-12-31/checkpoints/00__0.167_0.011_0.025_0.056_0.003_0.016_0.74.ckpt
+av2_mode: val # [val, test]
+save_res: False # [True, False]
+
+submit_version: '2024' # submit version
+num_frames: 2 
+
+loss_fn: deflowLoss
+# no need to change
+gpus: 1
+seed: 42069
