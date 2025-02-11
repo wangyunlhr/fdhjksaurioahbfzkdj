@@ -311,7 +311,7 @@ def compute_sceneflow(data_dir: Path, log_id: str, timestamps: Tuple[int, int], 
     return {'acc_pc0': point_cat, 'flow_0_1': flows_cat, 'classes_0': classes_cat,
             'valid_flow_0': valid_flow_cat, 'valid_point': valid_point_cat, 'ground_point': ground_point_cat, 
             'target_mask': target_mask_cat, 'ego_motion': ego1_SE3_ego0, 'class_valid': class_valid_cat}
-def process_log(data_dir: Path, log_id: str, output_dir: Path, n: Optional[int] = None) :
+def process_log(data_dir: Path, log_id: str, output_dir: Path, multi_frame: int, n: Optional[int] = None) :
 
     def create_group_data(group, pc, pose, point_valid, gm, target_mask=None, flow_0to1=None, 
                           flow_valid=None, flow_category=None, ego_motion=None, class_valid=None):
@@ -355,7 +355,8 @@ def process_log(data_dir: Path, log_id: str, output_dir: Path, n: Optional[int] 
             # else:
             group = f.create_group(str(ts0))
             pose0 = read_pose_pc_ground(data_dir, log_id, ts0, avm)
-            multi_frame = 19 #! 多帧
+            # multi_frame = 19 #! 多帧
+            print('multi_frame:', multi_frame)
             mid_frame = multi_frame // 2
             if cnt == len(timestamps) - 1:
                 stage = 'last'
@@ -388,7 +389,7 @@ def proc(x, ignore_current_process=False):
         pos = 1
     process_log(*x, n=pos)
     
-def process_logs(data_dir: Path, output_dir: Path, nproc: int):
+def process_logs(data_dir: Path, output_dir: Path, nproc: int, multi_frame: int):
     """Compute sceneflow for all logs in the dataset. Logs are processed in parallel.
        Args:
          data_dir: Argoverse 2.0 directory
@@ -401,7 +402,7 @@ def process_logs(data_dir: Path, output_dir: Path, nproc: int):
     
     # NOTE(Qingwen): if you don't want to all data_dir, then change here: logs = logs[:10] only 10 scene.
     logs = os.listdir(data_dir)
-    args = sorted([(data_dir, log, output_dir) for log in logs])
+    args = sorted([(data_dir, log, output_dir,  multi_frame) for log in logs])
     print(f'Using {nproc} processes to process data: {data_dir} to .h5 format. (#scenes: {len(args)})')
     # #! for debug
     # for x in tqdm(args):
@@ -416,16 +417,17 @@ def process_logs(data_dir: Path, output_dir: Path, nproc: int):
 
 def main(
     argo_dir: str = "/data0/dataset/av2",
-    output_dir: str ="/data1/dataset/av2/multi_frame_idx_19",
+    output_dir: str ="/data1/dataset/av2/debug",
     av2_type: str = "sensor",
     data_mode: str = "val",
     mask_dir: str = "/data0/dataset/av2/eval_mask",
+    multi_frame: int = 5,
     nproc: int = (multiprocessing.cpu_count() - 1)
 ):
     data_root_ = Path(argo_dir) / av2_type/ data_mode
     output_dir_ = Path(output_dir) / av2_type / data_mode
     output_dir_.mkdir(exist_ok=True, parents=True)
-    process_logs(data_root_, output_dir_, nproc)
+    process_logs(data_root_, output_dir_, nproc, multi_frame)
     create_reading_index(output_dir_)
     if data_mode == "val" or data_mode == "test":
         create_eval_mask(data_mode, output_dir_, mask_dir)
