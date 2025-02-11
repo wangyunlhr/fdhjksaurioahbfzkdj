@@ -17,7 +17,6 @@ dependencies:
   - hdbscan
   - s5cmd
   - pip:
-    - nuscenes-devkit
     - av2==0.2.1
     - dufomap==1.0.0
     - linefit
