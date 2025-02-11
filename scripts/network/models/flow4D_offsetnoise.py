@@ -207,7 +207,7 @@ class Flow4D(nn.Module):
 
         model_res = {
             "flow": flows, 
-            'pose_flow': pose_flows, 
+            'pose_flow': pose_flows_pc0, #! for pc0
 
             "pc0_valid_point_idxes": pc0_valid_point_idxes, 
             "pc0_points_lst": pc0_points_lst, 
