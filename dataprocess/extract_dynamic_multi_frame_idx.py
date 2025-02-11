@@ -356,7 +356,7 @@ def process_log(data_dir: Path, log_id: str, output_dir: Path, multi_frame: int,
             group = f.create_group(str(ts0))
             pose0 = read_pose_pc_ground(data_dir, log_id, ts0, avm)
             # multi_frame = 19 #! 多帧
-            print('multi_frame:', multi_frame)
+            # print('multi_frame:', multi_frame)
             mid_frame = multi_frame // 2
             if cnt == len(timestamps) - 1:
                 stage = 'last'
