@@ -89,20 +89,20 @@ class ModelWrapper(LightningModule):
             self.av2_mode = None
             if 'pretrained_weights' in cfg:
                 if cfg.pretrained_weights is not None:
-                    self.model.load_from_checkpoint(cfg.pretrained_weights)
-                # #! only load encoder weights
-                pretrained_state_dict = torch.load(cfg.pretrained_weights, map_location="cpu")  # 加载权重文件
+                    # self.model.load_from_checkpoint(cfg.pretrained_weights) #! no strict load全部参数
+                    # #! only load encoder weights
+                    pretrained_state_dict = torch.load(cfg.pretrained_weights, map_location="cpu")  # 加载权重文件
 
-                model_state_dict = self.model.state_dict()
-                # # 加载权重时只匹配部分参数
-                filtered_weights = {k[len("model."):].replace("embedder_4D", "embedder_4D_restore", 1): v for k, v in pretrained_state_dict['state_dict'].items() if k.startswith('model.embedder_4D')}
-                model_state_dict.update(filtered_weights)
-                self.model.load_state_dict(model_state_dict)
-                # 冻结加载的部分权重
-                for name, param in self.model.named_parameters():
-                    # print(name)
-                    if name.startswith('embedder_4D_restore'):  # 只冻结以 'embedder_4D' 为前缀的参数
-                        param.requires_grad = False  # 冻结该部分权重
+                    model_state_dict = self.model.state_dict()
+                    # # 加载权重时只匹配部分参数
+                    filtered_weights = {k[len("model."):].replace("embedder_4D", "embedder_4D_restore", 1): v for k, v in pretrained_state_dict['state_dict'].items() if k.startswith('model.embedder_4D')}
+                    model_state_dict.update(filtered_weights)
+                    self.model.load_state_dict(model_state_dict)
+                    # 冻结加载的部分权重
+                    for name, param in self.model.named_parameters():
+                        # print(name)
+                        if name.startswith('embedder_4D_restore'):  # 只冻结以 'embedder_4D' 为前缀的参数
+                            param.requires_grad = False  # 冻结该部分权重
 
 
 

@@ -15,6 +15,9 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import json
+from collections import defaultdict
+import faiss
+import time
 
 class HardEmbedder(nn.Module):
 
@@ -591,6 +594,7 @@ class DynamicEmbedder_4D_offset_add_noise(nn.Module):
         
         self.voxel_spatial_shape = pseudo_image_dims
         self.voxel_spatial_shape_1_2 = [int(v*2) for v in self.voxel_spatial_shape]
+        self.voxel_spatial_shape_4 = [int(v/4) for v in self.voxel_spatial_shape]
         self.var_sched = VarianceSchedule()
         self.point_cloud_range = point_cloud_range
         self.seperate_to_pc0_pc1 = Seperate_to_pc0_pc1()
@@ -643,6 +647,229 @@ class DynamicEmbedder_4D_offset_add_noise(nn.Module):
     
 
 
+
+
+
+
+    def fast_knn_gpu_before(self, sparse_points, sparse_voxels, dense_points, dense_voxels, K):
+        """
+        以 Voxel 为基准，使用 PyTorch GPU 进行高效 KNN 搜索，每个稀疏点找到同 voxel 内最近的 K 个稠密点。
+
+        Args:
+            sparse_points (torch.Tensor): (N, 3) 稀疏点坐标
+            sparse_voxels (torch.Tensor): (N, 3) 稀疏点的 voxel 坐标
+            dense_points (torch.Tensor): (M, 3) 稠密点坐标
+            dense_voxels (torch.Tensor): (M, 3) 稠密点的 voxel 坐标
+            K (int): 需要寻找的最近邻个数
+
+        Returns:
+            torch.Tensor: (N, K, 3) 形状的 Tensor，存放在 GPU 上，按 `sparse_points` 原顺序排列。
+        """
+        device = sparse_points.device
+        N = sparse_points.shape[0]
+
+        # 1. 计算每个 voxel 的唯一 key
+        sparse_voxel_keys = (sparse_voxels[:, 0] * self.voxel_spatial_shape_4[0] * self.voxel_spatial_shape_4[1] +
+                            sparse_voxels[:, 1] * self.voxel_spatial_shape_4[0] + sparse_voxels[:, 2])
+        
+        dense_voxel_keys = (dense_voxels[:, 0] * self.voxel_spatial_shape_4[0] * self.voxel_spatial_shape_4[1] +
+                            dense_voxels[:, 1] * self.voxel_spatial_shape_4[0] + dense_voxels[:, 2])
+
+        # 2. 在 CPU 端构建 Voxel 内点的映射
+        voxel_to_dense = defaultdict(list)
+        for i, key in enumerate(dense_voxel_keys.cpu().tolist()):
+            voxel_to_dense[key].append(i)
+
+        # 3. **提前分配 Tensor**
+        results = torch.full((N, K, 3), float('nan'), device=device)  # 预填充 NaN 以检查未赋值的点
+        mask = torch.zeros(N, dtype=torch.bool, device=device)  # 记录哪些点没有找到足够的邻居
+
+        # 4. **利用 `inverse_indices` 进行索引匹配**
+        unique_sparse_keys, inverse_indices = torch.unique(sparse_voxel_keys, return_inverse=True)
+
+        # 向量化处理所有 voxel
+        for i, voxel_key in enumerate(unique_sparse_keys):
+            sparse_indices = torch.where(inverse_indices == i)[0]  # 直接用 inverse_indices 查找
+            sparse_pts = sparse_points[sparse_indices]  # (Nsparse, 3)
+
+            if voxel_key.item() in voxel_to_dense:
+                dense_indices = voxel_to_dense[voxel_key.item()]
+                dense_pts = dense_points[dense_indices]  # (Ndense, 3)
+
+                # **并行计算 KNN**
+                distances = torch.cdist(sparse_pts, dense_pts)  # (Nsparse, Ndense)
+                knn_indices = distances.topk(k=min(K, len(dense_pts)), dim=1, largest=False).indices
+
+                # **填充 K 个邻居**
+                num_neighbors = knn_indices.shape[1]
+                if num_neighbors < K:
+                    # **从已有的 topk 结果里随机重复采样**
+                    repeat_indices = torch.randint(0, num_neighbors, (K - num_neighbors,), device=device)
+                    sampled_knn_indices = torch.cat([knn_indices, knn_indices[:, repeat_indices]], dim=1)
+                    mask[sparse_indices] = True  # 标记哪些点进行了补全
+                else:
+                    sampled_knn_indices = knn_indices  # 直接使用已有的 K 个
+
+                # **存储结果（使用 scatter_ 直接存入原顺序）**
+                results[sparse_indices] = dense_pts[sampled_knn_indices]
+
+        return results  # 直接返回 CUDA 上的 Tensor，保证顺序
+
+
+
+
+
+
+
+
+
+
+
+    def fast_knn_gpu(self, sparse_points, sparse_voxels, dense_points, dense_voxels, K):
+        """
+        以 Voxel 为基准，使用 PyTorch GPU 进行高效 KNN 搜索，每个稀疏点找到同 voxel 内最近的 K 个稠密点。
+
+        Args:
+            sparse_points (torch.Tensor): (N, 3) 稀疏点坐标 (float32, CUDA)
+            sparse_voxels (torch.Tensor): (N, 3) 稀疏点的 voxel 坐标 (int32, CUDA)
+            dense_points (torch.Tensor): (M, 3) 稠密点坐标 (float32, CUDA)
+            dense_voxels (torch.Tensor): (M, 3) 稠密点的 voxel 坐标 (int32, CUDA)
+            K (int): 需要寻找的最近邻个数
+
+        Returns:
+            torch.Tensor: (N, K, 3) 形状的 Tensor存放在 GPU 上，按 `sparse_points` 原顺序排列。
+        """
+        device = sparse_points.device
+        N, M = sparse_points.shape[0], dense_points.shape[0]
+
+        # 1. 计算 Voxel 索引，避免 CPU 端字典操作
+        voxel_spatial_shape = self.voxel_spatial_shape_4  # 假设是 [x, y, z] 大小
+        sparse_voxel_keys = (sparse_voxels[:, 0] * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+                            sparse_voxels[:, 1] * voxel_spatial_shape[0] + sparse_voxels[:, 2])
+        dense_voxel_keys = (dense_voxels[:, 0] * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+                            dense_voxels[:, 1] * voxel_spatial_shape[0] + dense_voxels[:, 2])
+
+        # 2. 获取唯一的 sparse_voxel_keys 和其索引
+        unique_sparse_keys, inverse_indices = torch.unique(sparse_voxel_keys, return_inverse=True)
+
+        # 3. **利用 Tensor 直接构建索引映射**
+        dense_sorted_indices = torch.argsort(dense_voxel_keys)  # 先排序
+        sorted_dense_keys = dense_voxel_keys[dense_sorted_indices]  # 排序后的 voxel keys
+
+        # 4. 在 GPU 端搜索 Voxel 中的点索引，避免 Python `defaultdict`
+        voxel_start_idx = torch.searchsorted(sorted_dense_keys, unique_sparse_keys)  # 查找起始索引
+        voxel_end_idx = torch.searchsorted(sorted_dense_keys, unique_sparse_keys, side="right")  # 查找结束索引
+
+        # 5. **提前分配 `(N, K, 3)` Tensor**
+        results = torch.full((N, K, 3), float('nan'), device=device)  # 直接创建 CUDA Tensor
+
+        # 6. **完全并行 KNN 计算**
+        for i, voxel_key in enumerate(unique_sparse_keys):
+            sparse_indices = torch.where(inverse_indices == i)[0]  # 取出该 voxel 里的所有 sparse 点
+            sparse_pts = sparse_points[sparse_indices]  # (Nsparse, 3)
+
+            start_idx, end_idx = voxel_start_idx[i], voxel_end_idx[i]
+            if start_idx < end_idx:  # 该 voxel 里有稠密点
+                dense_indices = dense_sorted_indices[start_idx:end_idx]  # 提取该 voxel 内的 dense 索引
+                dense_pts = dense_points[dense_indices]  # (Ndense, 3)
+
+                # **计算 KNN**
+                distances = torch.cdist(sparse_pts, dense_pts)  # (Nsparse, Ndense)
+                knn_indices = distances.topk(k=min(K, len(dense_pts)), dim=1, largest=False).indices  # 取最近 K 个
+
+                # **填充 K 个邻居**
+                num_neighbors = knn_indices.shape[1]
+                if num_neighbors < K:
+                    repeat_indices = torch.randint(0, num_neighbors, (K - num_neighbors,), device=device)
+                    knn_indices = torch.cat([knn_indices, knn_indices[:, repeat_indices]], dim=1)
+
+                # **并行存储到 `results`** 
+                #! 这里的 `results` 已经是按 `sparse_points` 原顺序排列的
+                results[sparse_indices] = dense_pts[knn_indices]
+
+        return results  # 直接返回 CUDA Tensor
+
+
+    def fast_knn_faiss(self, sparse_points, sparse_voxels, dense_points, dense_voxels, K):
+        """
+        以 Voxel 为基准，使用 FAISS 进行 GPU 加速 KNN 搜索，每个稀疏点找到同 voxel 内最近的 K 个稠密点。
+
+        Args:
+            sparse_points (torch.Tensor): (N, 3) 稀疏点坐标 (float32, CUDA)
+            sparse_voxels (torch.Tensor): (N, 3) 稀疏点的 voxel 坐标 (int32, CUDA)
+            dense_points (torch.Tensor): (M, 3) 稠密点坐标 (float32, CUDA)
+            dense_voxels (torch.Tensor): (M, 3) 稠密点的 voxel 坐标 (int32, CUDA)
+            K (int): 需要寻找的最近邻个数
+
+        Returns:
+            torch.Tensor: (N, K, 3) 形状的 Tensor，存放在 GPU 上，按 `sparse_points` 原顺序排列。
+        """
+        device = sparse_points.device
+        N, M = sparse_points.shape[0], dense_points.shape[0]
+
+        # 1. 计算 Voxel 索引
+        voxel_spatial_shape = self.voxel_spatial_shape_4
+        sparse_voxel_keys = (sparse_voxels[:, 0] * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+                            sparse_voxels[:, 1] * voxel_spatial_shape[0] + sparse_voxels[:, 2])
+        dense_voxel_keys = (dense_voxels[:, 0] * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+                            dense_voxels[:, 1] * voxel_spatial_shape[0] + dense_voxels[:, 2])
+
+        # 2. 获取唯一的 sparse_voxel_keys 和其索引
+        unique_sparse_keys, inverse_indices = torch.unique(sparse_voxel_keys, return_inverse=True)
+
+        # 3. **使用 FAISS 进行 GPU 加速 KNN 搜索**
+        index = faiss.IndexFlatL2(3)  # L2 距离索引 (欧几里得距离)
+        res = faiss.StandardGpuResources()  # GPU 资源管理
+        gpu_index = faiss.index_cpu_to_gpu(res, 0, index)  # 将索引移动到 GPU
+
+        # 4. **构建 GPU KNN 索引**
+        gpu_index.add(dense_points.cpu().numpy())  # FAISS 需要 NumPy 输入
+
+        # 5. **执行 KNN 搜索**
+        distances, knn_indices = gpu_index.search(sparse_points.cpu().numpy(), K)  # 在 GPU 上搜索最近 K 个点
+
+        # 6. **转换为 PyTorch Tensor 并返回**
+        knn_indices = torch.tensor(knn_indices, dtype=torch.long, device=device)  # (N, K)
+        results = dense_points[knn_indices]  # (N, K, 3)
+
+        return results  # 直接返回 CUDA Tensor
+
+
+
+    def fast_knn_faiss_hnsw(self, sparse_points, sparse_voxels, dense_points, dense_voxels, K):
+        """
+        以 Voxel 为基准，使用 FAISS + HNSW 进行 **近似最近邻 (ANN)** 搜索，加速 KNN。
+
+        Args:
+            sparse_points (torch.Tensor): (N, 3) 稀疏点坐标 (float32, CUDA)
+            sparse_voxels (torch.Tensor): (N, 3) 稀疏点的 voxel 坐标 (int32, CUDA)
+            dense_points (torch.Tensor): (M, 3) 稠密点坐标 (float32, CUDA)
+            dense_voxels (torch.Tensor): (M, 3) 稠密点的 voxel 坐标 (int32, CUDA)
+            K (int): 需要寻找的最近邻个数
+
+        Returns:
+            torch.Tensor: (N, K, 3) 形状的 Tensor，存放在 GPU 上，按 `sparse_points` 原顺序排列。
+        """
+        device = sparse_points.device
+        N, M = sparse_points.shape[0], dense_points.shape[0]
+
+        # 1. **使用 FAISS HNSW 近似最近邻搜索**
+        index = faiss.IndexHNSWFlat(3, 32)  # 使用 HNSW (32 近邻)，比 `IndexFlatL2` 更快
+        res = faiss.StandardGpuResources()  # GPU 资源管理
+        gpu_index = faiss.index_cpu_to_gpu(res, 0, index)  # 将索引移动到 GPU
+
+        # 2. **构建 GPU HNSW 索引**
+        gpu_index.add(dense_points.cpu().numpy())  # FAISS 需要 NumPy 输入
+
+        # 3. **执行 KNN 搜索**
+        distances, knn_indices = gpu_index.search(sparse_points.cpu().numpy(), K)  # 近似最近邻搜索
+
+        # 4. **转换为 PyTorch Tensor 并返回**
+        knn_indices = torch.tensor(knn_indices, dtype=torch.long, device=device)  # (N, K)
+        results = dense_points[knn_indices]  # (N, K, 3)
+
+        return results  # 直接返回 CUDA Tensor
+    
     def forward(self, input_dict, training_flag) -> torch.Tensor:
         voxel_feats_list = []
         voxel_coors_list = []
@@ -728,6 +955,8 @@ class DynamicEmbedder_4D_offset_add_noise(nn.Module):
                 
                 pc_all = input_dict[noise_frame_key]
                 voxel_info_list_all = self.voxelizer_4(pc_all)
+                pc_sparse = input_dict[sparse_frame_key]
+                voxel_info_list_all_sparse = self.voxelizer_4(pc_sparse)
                 # result_dict = {
                 #     "points": valid_batch_non_nan_points, #除去nan以及不在point_range内的点
                 #     "voxel_coords": valid_batch_voxel_coords, #有效点对应的voxel坐标
@@ -738,6 +967,19 @@ class DynamicEmbedder_4D_offset_add_noise(nn.Module):
                 for b_idx, voxel_info_dict_all in enumerate(voxel_info_list_all):
                     points_all = voxel_info_dict_all['points']
                     coordinates_all = voxel_info_dict_all['voxel_coords'] #! z,y,x
+                    points_sparse = voxel_info_list_all_sparse[b_idx]['points']
+                    coordinates_sparse = voxel_info_list_all_sparse[b_idx]['voxel_coords'] #! z,y,x
+                    # start_time1 = time.time()
+                    neighbor = self.fast_knn_gpu(points_sparse, coordinates_sparse, points_all, coordinates_all, 5)
+                    assert torch.isnan(neighbor).any() == False
+                    # print(f"time for knn search: {time.time() - start_time1}")
+                    # start_time2 = time.time()
+                    # neighbor = self.fast_knn_gpu_before(points_sparse, coordinates_sparse, points_all, coordinates_all, 5)
+                    # print(f"time for before: {time.time() - start_time2}")
+                    # start_time3 = time.time()
+                    # neighbor = self.fast_knn_faiss_hnsw(points_sparse, coordinates_sparse, points_all, coordinates_all, 5)
+                    # print(f"time for faiss_hnsw: {time.time() - start_time3}")
+                    
                     batch_indices_all = torch.full((coordinates_all.size(0), 1), b_idx, dtype=torch.long, device=voxel_coors.device)
                     voxel_coors_b = torch.cat([batch_indices_all, coordinates_all[:, [2, 1, 0]]], dim=1) 
                     #! voxel中心
@@ -756,7 +998,7 @@ class DynamicEmbedder_4D_offset_add_noise(nn.Module):
                     noise = noise * (self.vx/2) #0.4
                     out = self.var_sched.q_sample(x_start=points_offset_voxel_center, t=ts[b_idx], noise = noise) 
                     #! 确认out的范围 
-                    check_out_range = True
+                    check_out_range = False
                     if check_out_range:
                         abnormal_mask = (torch.abs(out) > 0.4).any(dim=1)
                         abnormal_num = abnormal_mask.sum().item()
