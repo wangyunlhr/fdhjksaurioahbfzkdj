@@ -9,7 +9,7 @@
 # Description: Torch dataloader for the dataset we preprocessed.
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import torch
 from torch.utils.data import Dataset, DataLoader
 import h5py, os, pickle, argparse
@@ -339,7 +339,7 @@ class HDF5Dataset_multi_frame_idx_changedataloader(Dataset):
         
         with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
             self.data_index = pickle.load(f)
-        self.data_index = sorted(self.data_index)[59990:80000] # sorted for debug
+        self.data_index = sorted(self.data_index)[39990:60000] # sorted for debug
 
         with open('/data0/code/Flow4D_diff_less_to_more/conf/labeling.yaml', 'r') as file:
             labeling_map = yaml.safe_load(file)
@@ -514,6 +514,14 @@ class HDF5Dataset_multi_frame_idx_changedataloader(Dataset):
                 f[key].create_dataset("new_lidar_sparse", data = points_sparse.cpu().numpy().astype(np.float32))
                 f[key].create_dataset("new_lidar_neighbor_sparse", data = neighbor.cpu().numpy().astype(np.float32))
                 f[key].create_dataset("all_to_new_lidar_sparse_idx", data = indices_A_to_C.cpu().numpy().astype(np.float32))
+            
+            del pc0_all, pc0_one
+            del voxel_info_dict_all, voxel_info_dict_all_sparse
+            del points_all, coordinates_all, points_sparse, coordinates_sparse, point_idxes_sparse
+            del neighbor, indices_A_to_B, indices_A_to_C
+
+            # 释放 GPU 缓存（减少显存占用）
+            torch.cuda.empty_cache()
 
 
         return res_dict
@@ -1051,6 +1059,6 @@ if __name__ == "__main__":
 
     # testing eval mode
     dataset = HDF5Dataset_multi_frame_idx_changedataloader(options.data_path+"/"+options.data_mode, n_frames=2, eval=False)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=8)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
     for data in tqdm(dataloader, ncols=80, desc="eval mode"):
         res_dict = data
