@@ -269,4 +269,55 @@ class OfficialMetrics:
             printed_data.append([key, self.bucketed[key]['Static'], self.bucketed[key]['Dynamic']])
         print("Version 2 Metric on Category-based:")
         print(tabulate(printed_data, headers=["Class", "Static", "Dynamic"], tablefmt='orgtbl'), "\n")
+
+
+
+class PointMetrics:
+    def __init__(self):
+        # same with BUCKETED_METACATAGORIES
+        self.point_bag= {
+            'BACKGROUND':[],
+            'CAR':[],
+            'OTHER_VEHICLES': [],
+            'PEDESTRIAN': [],
+            'WHEELED_VRU': [],
+            'Mean': []
+        }
+
+        self.norm_flag = False
+
+
+        # bucket_max_speed, num_buckets, distance_thresholds set is from: eval/bucketed_epe.py#L226
+        # bucket_edges = np.concatenate([np.linspace(0, 2.0, 51), [np.inf]])
+        # speed_thresholds = list(zip(bucket_edges, bucket_edges[1:]))
+        # self.bucketedMatrix = BucketResultMatrix(
+        #     class_names=['BACKGROUND', 'CAR', 'OTHER_VEHICLES', 'PEDESTRIAN', 'WHEELED_VRU'],
+        #     speed_buckets=speed_thresholds
+        # )
+    def step(self, point_dict):
+        """
+        This step function is used to store the results of **each frame**.
+        """
+        for key in point_dict:
+            self.point_bag[key.name].append(key.avg_epe)
+
+
+    def normalize(self):
+        """
+        This normalize mean average results between **frame and frame**.
+        """
+        for key in self.point_bag:
+            self.point_bag[key] = np.mean(self.point_bag[key])
+        self.point_bag['Mean'] = np.mean([self.point_bag['BACKGROUND'], self.point_bag['CAR'], self.point_bag['OTHER_VEHICLES'],
+                                          self.point_bag['PEDESTRIAN'], self.point_bag['WHEELED_VRU']])
+
+        self.norm_flag = True
     
+    def print(self):
+        if not self.norm_flag:
+            self.normalize()
+        printed_data = []
+        for key in self.point_bag:
+            printed_data.append([key,self.point_bag[key]])
+        print("point class 1 Metric on EPE :")
+        print(tabulate(printed_data), "\n")

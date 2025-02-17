@@ -856,3 +856,69 @@ def compute_bucketed_epe(
             storage_error_matrix.append(BaseSplitValue(cats_name, avg_epe, avg_speed, (min_speed_threshold, max_speed_threshold), count_pts))
             
     return storage_error_matrix
+
+
+
+
+
+from dataclasses import dataclass
+@dataclass(frozen=True, eq=True, repr=True)
+class PointSplitValue:
+    name: str
+    avg_epe: float
+    count: int
+    def __eq__(self, __value: object) -> bool:
+        return hash(self) == hash(__value)
+def compute_point_epe(
+    pred_flow: NDArrayFloat,
+    gt_flow: NDArrayFloat,
+    category_indices: NDArrayInt,
+    # is_valid: NDArrayBool,
+):
+    storage_error_matrix = []
+    # bucket_max_speed, num_buckets, distance_thresholds set is from: eval/bucketed_epe.py#L226
+    # bucket_edges = np.concatenate([np.linspace(0, 2.0, 51), [np.inf]])
+    # speed_thresholds = list(zip(bucket_edges, bucket_edges[1:]))
+
+    # gt_speeds = np.linalg.norm(gt_flow, axis=-1)
+    error_flow = np.linalg.norm(pred_flow - gt_flow, axis=-1)
+    # based on each category, compute the epe
+    for cats_name in BUCKETED_METACATAGORIES:
+        selected_classes_ids = [CATEGORY_TO_INDEX[cat] for cat in BUCKETED_METACATAGORIES[cats_name]] #!对应到大类上
+        cat_mask = np.isin(category_indices, np.array(selected_classes_ids))
+        # since background don't have speed, we just compute the average epe
+        count_pts = cat_mask.sum()
+        if count_pts == 0:
+            continue
+        storage_error_matrix.append(PointSplitValue(cats_name, error_flow[cat_mask].mean(), count_pts))
+
+            
+    return storage_error_matrix
+
+
+
+
+
+
+
+#! 仅恢复点的大类别loss
+def compute_class_loss(
+    pred_point,
+    gt_point,
+    category_indices,
+):
+
+    weight_loss = 0.0
+    device = pred_point.device
+    for cats_name in BUCKETED_METACATAGORIES:
+        selected_classes_ids = [CATEGORY_TO_INDEX[cat] for cat in BUCKETED_METACATAGORIES[cats_name]] #!对应到大类上
+        cat_mask = torch.isin(category_indices, torch.tensor(selected_classes_ids, device=device))
+        count_pts = cat_mask.sum()
+        if count_pts == 0:
+            continue
+        pred = pred_point[cat_mask]
+        gt = gt_point[cat_mask]
+        pts_loss = torch.linalg.vector_norm(pred - gt, dim=-1).mean()
+        weight_loss += pts_loss
+            
+    return weight_loss
