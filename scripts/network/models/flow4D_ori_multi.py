@@ -63,7 +63,7 @@ class Flow4D(nn.Module):
         print("\nLoading... model weight from: ", ckpt_path, "\n")
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
-    def forward(self, batch):
+    def forward(self, batch, trainflag):
         #t_deflow_start = time.time()
         """
         input: using the batch from dataloader, which is a dict

@@ -1152,7 +1152,7 @@ class DynamicEmbedder_4D_offset_add_noise_NK(nn.Module):
         self.y_offset = self.vy / 2 + point_cloud_range[1]
         self.z_offset = self.vz / 2 + point_cloud_range[2]
         self.voxel_size = voxel_size
-        self.zeromask = nn.Parameter(torch.zeros(64))
+        # self.zeromask = nn.Parameter(torch.zeros(64))
         self.pos_embed = nn.Sequential(
             nn.Linear(3, 16),
             nn.GELU(),
@@ -2174,3 +2174,90 @@ class DynamicEmbedder_4D_offset_add_noise_idx(nn.Module):
             return restore_point_dict, total_loss
         else:
             return restore_point_dict
+        
+
+class DynamicEmbedder_4D_multi(nn.Module):
+
+    def __init__(self, voxel_size, pseudo_image_dims, point_cloud_range,
+                 feat_channels: int) -> None:
+        super().__init__()
+        self.voxelizer = DynamicVoxelizer(voxel_size=voxel_size,
+                                          point_cloud_range=point_cloud_range)
+        self.feature_net = DynamicPillarFeatureNet_flow4D(
+            in_channels=3,
+            feat_channels=(feat_channels, ),
+            point_cloud_range=point_cloud_range,
+            voxel_size=voxel_size,
+            mode='avg')
+        self.scatter = PointPillarsScatter(in_channels=feat_channels,
+                                           output_shape=pseudo_image_dims)
+        
+        self.voxel_spatial_shape = pseudo_image_dims
+
+    def forward(self, input_dict) -> torch.Tensor:
+        voxel_feats_list = []
+        voxel_coors_list = []
+        batch_index = 0
+
+        frame_keys = sorted([key for key in input_dict.keys() if key.startswith('pc_m')], reverse=True)
+        frame_keys += ['pc0_all', 'pc1_all', 'pc0s', 'pc1s']
+
+        pc0_point_feats_lst = []
+
+        for time_index, frame_key in enumerate(frame_keys):
+            pc = input_dict[frame_key]
+            voxel_info_list = self.voxelizer(pc)
+            # result_dict = {
+            #     "points": valid_batch_non_nan_points, #除去nan以及不在point_range内的点
+            #     "voxel_coords": valid_batch_voxel_coords, #有效点对应的voxel坐标
+            #     "point_idxes": valid_point_idxes, #每个有效点对应的voxel内的索引
+            #     "point_offsets": point_offsets #每个有效点对应的voxel中心的偏移量
+            # }
+            voxel_feats_list_batch = []
+            voxel_coors_list_batch = []
+
+            for batch_index, voxel_info_dict in enumerate(voxel_info_list):
+                points = voxel_info_dict['points']
+                coordinates = voxel_info_dict['voxel_coords']
+                voxel_feats, voxel_coors, point_feats = self.feature_net(points, coordinates)
+
+                if frame_key == 'pc0s':
+                    pc0_point_feats_lst.append(point_feats)
+                    
+                batch_indices = torch.full((voxel_coors.size(0), 1), batch_index, dtype=torch.long, device=voxel_coors.device)
+                voxel_coors_batch = torch.cat([batch_indices, voxel_coors[:, [2, 1, 0]]], dim=1)
+
+                voxel_feats_list_batch.append(voxel_feats)
+                voxel_coors_list_batch.append(voxel_coors_batch)
+
+            voxel_feats_sp = torch.cat(voxel_feats_list_batch, dim=0) #N*16 在0维度进行B的拼接
+            coors_batch_sp = torch.cat(voxel_coors_list_batch, dim=0).to(dtype=torch.int32) #N*4
+
+            time_dimension = torch.full((coors_batch_sp.shape[0], 1), time_index, dtype=torch.int32, device='cuda')
+            coors_batch_sp_4d = torch.cat((coors_batch_sp, time_dimension), dim=1)
+
+            voxel_feats_list.append(voxel_feats_sp) #不同time下的voxel特征
+            voxel_coors_list.append(coors_batch_sp_4d)  #batch_idx, x,y,z, time_idx 
+
+            if frame_key == 'pc0s':
+                pc0s_3dvoxel_infos_lst = voxel_info_list
+                pc0s_num_voxels = voxel_feats_sp.shape[0]
+
+        all_voxel_feats_sp = torch.cat(voxel_feats_list[:2], dim=0)
+        all_coors_batch_sp_4d = torch.cat(voxel_coors_list[:2], dim=0)
+
+        sparse_tensor_4d = spconv.SparseConvTensor(all_voxel_feats_sp.contiguous(), all_coors_batch_sp_4d.contiguous(), self.voxel_spatial_shape, int(batch_index + 1))
+        # coors_less = torch.cat(voxel_coors_list[2:], dim=0)
+        # coors_less[:,4] -= 2
+
+        # feature_less = sparse_tensor_4d.dense().permute(0,2,3,4,5,1)[coors_less[:,0], coors_less[:,1],coors_less[:,2], coors_less[:,3], coors_less[:,4],:]  # B,C,X,Y,Z
+        # sparse_tensor_4d_less = spconv.SparseConvTensor(feature_less.contiguous(), coors_less.contiguous(), self.voxel_spatial_shape, int(batch_index + 1))
+
+        output = {
+            '4d_tensor': sparse_tensor_4d,
+            'pc0_3dvoxel_infos_lst': pc0s_3dvoxel_infos_lst,
+            'pc0_point_feats_lst': pc0_point_feats_lst,
+            'pc0_mum_voxels': pc0s_num_voxels # 第0帧包括所有batch的voxel数量
+        }
+
+        return output

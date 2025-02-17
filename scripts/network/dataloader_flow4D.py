@@ -9,7 +9,7 @@
 # Description: Torch dataloader for the dataset we preprocessed.
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 from torch.utils.data import Dataset, DataLoader
 import h5py, os, pickle, argparse
@@ -392,6 +392,175 @@ def collate_fn_pad_NK(batch):
 
 
 
+
+
+#! multi_frame_idx 多帧加载监督M*3个点，配合collate_fn_pad_less_to_more
+class HDF5Dataset_multi_frame_idx(Dataset):
+    def __init__(self, directory, n_frames, eval = False):
+        '''
+        directory: the directory of the dataset
+        eval: if True, use the eval index
+        '''
+        super(HDF5Dataset_multi_frame_idx, self).__init__()
+        self.directory = directory
+        self.mode = os.path.basename(self.directory)
+        
+        with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
+            self.data_index = pickle.load(f)
+        # self.data_index = sorted(self.data_index) # sorted for debug
+
+        with open('/data0/code/Flow4D_diff_less_to_more/conf/labeling.yaml', 'r') as file:
+            labeling_map = yaml.safe_load(file)
+
+        self.learning_map = labeling_map['Argoverse_learning_map']
+
+        self.n_frames = n_frames
+        assert self.n_frames >= 2, "n_frames must be 2 or more."
+        
+        print('dataloader mode = {} num_frames = {}'.format(self.mode, self.n_frames))
+
+        self.eval_index = False
+        if eval:
+            if not os.path.exists(os.path.join(self.directory, 'index_eval.pkl')):
+                raise Exception(f"No eval index file found! Please check {self.directory}")
+            self.eval_index = eval
+
+            if self.mode == 'val':
+                with open(os.path.join(self.directory, 'index_eval.pkl'), 'rb') as f:
+                    self.eval_data_index = pickle.load(f)
+            elif self.mode == 'test':
+                with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f: #jy
+                    self.eval_data_index = pickle.load(f)
+            else:
+                raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        self.scene_id_bounds = {}  # 存储每个scene_id的最大最小timestamp和位置
+        for idx, (scene_id, timestamp) in enumerate(self.data_index):
+            if scene_id not in self.scene_id_bounds:
+                self.scene_id_bounds[scene_id] = {
+                    "min_timestamp": timestamp,
+                    "max_timestamp": timestamp,
+                    "min_index": idx,
+                    "max_index": idx
+                }
+            else:
+                bounds = self.scene_id_bounds[scene_id]
+                # 更新最小timestamp和位置
+                if timestamp < bounds["min_timestamp"]:
+                    bounds["min_timestamp"] = timestamp
+                    bounds["min_index"] = idx
+                # 更新最大timestamp和位置
+                if timestamp > bounds["max_timestamp"]:
+                    bounds["max_timestamp"] = timestamp
+                    bounds["max_index"] = idx
+
+    def __len__(self):
+        if self.eval_index:
+            return len(self.eval_data_index)
+        return len(self.data_index)
+    
+    def __getitem__(self, index_):
+        if self.eval_index:
+            scene_id, timestamp = self.eval_data_index[index_]
+            # find this one index in the total index
+            index_ = self.data_index.index([scene_id, timestamp]) 
+        else:
+            scene_id, timestamp = self.data_index[index_] 
+            # to make sure we have continuous frames
+            if (self.scene_id_bounds[scene_id]["max_index"] - 1) <= index_: #! 因为最后一阵没有target_mask
+                index_ = index_ - 2
+            scene_id, timestamp = self.data_index[index_] 
+
+        key = str(timestamp)
+        with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f: 
+            pc0 = torch.tensor(f[key]['lidar'][:]) 
+            gm0 = torch.tensor(f[key]['ground_mask'][:]) 
+            pose0 = torch.tensor(f[key]['pose'][:]) 
+            pc0_valid = torch.tensor(f[key]['point_valid'][:]) 
+
+            if self.scene_id_bounds[scene_id]["max_index"] == index_: 
+                return self.__getitem__(index_ + 1)
+            else:
+                next_timestamp = str(self.data_index[index_+1][1])
+
+            pc1 = torch.tensor(f[next_timestamp]['lidar'][:])
+            gm1 = torch.tensor(f[next_timestamp]['ground_mask'][:]) 
+            pose1 = torch.tensor(f[next_timestamp]['pose'][:])
+            pc1_valid = torch.tensor(f[next_timestamp]['point_valid'][:]) 
+
+
+            res_dict = {
+                'scene_id': scene_id,
+                'timestamp': key,
+                'pc0': pc0, #current
+                'gm0': gm0, #current
+                'pose0': pose0, #current
+                'pc0_valid': pc0_valid, #current
+                'pc1': pc1, #nect
+                'gm1': gm1, #next
+                'pose1': pose1, #next
+                'pc1_valid': pc1_valid, #next
+            }
+
+
+            if self.n_frames > 2: 
+                past_frames = []
+                num_past_frames = self.n_frames - 2  
+
+                for i in range(1, num_past_frames + 1):
+                    frame_index = index_ - i
+                    if frame_index < self.scene_id_bounds[scene_id]["min_index"]: 
+                        frame_index = self.scene_id_bounds[scene_id]["min_index"] 
+
+                    past_timestamp = str(self.data_index[frame_index][1])
+                    past_pc = torch.tensor(f[past_timestamp]['lidar'][:])
+                    past_gm = torch.tensor(f[past_timestamp]['ground_mask'][:])
+                    past_pose = torch.tensor(f[past_timestamp]['pose'][:])
+
+                    past_frames.append((past_pc, past_gm, past_pose))
+
+                for i, (past_pc, past_gm, past_pose) in enumerate(past_frames):
+                    res_dict[f'pc_m{i+1}'] = past_pc
+                    res_dict[f'gm_m{i+1}'] = past_gm
+                    res_dict[f'pose_m{i+1}'] = past_pose
+
+            if 'flow' in f[key]:
+                flow = torch.tensor(f[key]['flow'][:])
+                flow_is_valid = torch.tensor(f[key]['flow_is_valid'][:]) 
+                flow_category_indices = torch.tensor(f[key]['flow_category_indices'][:]) 
+                target_mask_pc0 = torch.tensor(f[key]['target_mask'][:]) 
+                target_mask_pc1 = torch.tensor(f[next_timestamp]['target_mask'][:]) #! pc1_mask
+                class_valid = torch.tensor(f[key]['class_valid'][:]) 
+                res_dict['flow'] = flow
+                res_dict['flow_is_valid'] = flow_is_valid
+                res_dict['flow_category_indices'] = flow_category_indices
+                res_dict['target_mask_pc0'] = target_mask_pc0
+                res_dict['target_mask_pc1'] = target_mask_pc1
+                res_dict['class_valid'] = class_valid
+                flow_category_labeled = map_label(f[key]['flow_category_indices'][:], self.learning_map) 
+                flow_category_labeled_tensor = torch.tensor(flow_category_labeled, dtype=torch.int32)
+                res_dict['flow_category_labeled'] = flow_category_labeled_tensor 
+
+            if 'ego_motion' in f[key]:
+                ego_motion = torch.tensor(f[key]['ego_motion'][:])
+                res_dict['ego_motion'] = ego_motion
+
+
+            if self.eval_index: 
+                if self.mode == 'val':
+                    eval_mask = torch.tensor(f[key]['eval_mask'][:])
+                    res_dict['eval_mask'] = eval_mask 
+                elif self.mode == 'test':
+                    eval_mask = torch.ones(pc0.shape[0], 1, dtype=torch.bool) 
+                    res_dict['eval_mask'] = eval_mask
+                else:
+                    raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        return res_dict
+
+
+
+
 #! multi_frame_idx 多帧加载监督N,K,3个点，配合collate_fn_pad_less_to_more_NK
 class HDF5Dataset_multi_frame_idx_NK(Dataset):
     def __init__(self, directory, n_frames, eval = False):
@@ -758,24 +927,24 @@ class HDF5Dataset_multi_frame_idx_changedataloader(Dataset):
                 #存储全部点到point_idxes_sparse的映射
                 indices_A_to_B = pc0_one_mask.nonzero(as_tuple=True)[0]
                 indices_A_to_C = indices_A_to_B[point_idxes_sparse.cpu()]
-                assert torch.allclose(points_sparse.cpu(), pc0[indices_A_to_C])
-                if "new_lidar_sparse" in f[key]:
-                    del f[key]["new_lidar_sparse"]
-                if "new_lidar_neighbor_sparse" in f[key]:
-                    del f[key]["new_lidar_neighbor_sparse"]
-                if "all_to_new_lidar_sparse_idx" in f[key]:
-                    del f[key]["all_to_new_lidar_sparse_idx"]
-                f[key].create_dataset("new_lidar_sparse", data = points_sparse.cpu().numpy().astype(np.float32))
-                f[key].create_dataset("new_lidar_neighbor_sparse", data = neighbor.cpu().numpy().astype(np.float32))
-                f[key].create_dataset("all_to_new_lidar_sparse_idx", data = indices_A_to_C.cpu().numpy().astype(np.float32))
+            #     assert torch.allclose(points_sparse.cpu(), pc0[indices_A_to_C])
+            #     if "new_lidar_sparse" in f[key]:
+            #         del f[key]["new_lidar_sparse"]ssss
+            #     if "new_lidar_neighbor_sparse" in f[key]:
+            #         del f[key]["new_lidar_neighbor_sparse"]
+            #     if "all_to_new_lidar_sparse_idx" in f[key]:
+            #         del f[key]["all_to_new_lidar_sparse_idx"]
+            #     f[key].create_dataset("new_lidar_sparse", data = points_sparse.cpu().numpy().astype(np.float32))
+            #     f[key].create_dataset("new_lidar_neighbor_sparse", data = neighbor.cpu().numpy().astype(np.float32))
+            #     f[key].create_dataset("all_to_new_lidar_sparse_idx", data = indices_A_to_C.cpu().numpy().astype(np.float32))
             
-            del pc0_all, pc0_one
-            del voxel_info_dict_all, voxel_info_dict_all_sparse
-            del points_all, coordinates_all, points_sparse, coordinates_sparse, point_idxes_sparse
-            del neighbor, indices_A_to_B, indices_A_to_C
+            # del pc0_all, pc0_one
+            # del voxel_info_dict_all, voxel_info_dict_all_sparse
+            # del points_all, coordinates_all, points_sparse, coordinates_sparse, point_idxes_sparse
+            # del neighbor, indices_A_to_B, indices_A_to_C
 
-            # 释放 GPU 缓存（减少显存占用）
-            torch.cuda.empty_cache()
+            # # 释放 GPU 缓存（减少显存占用）
+            # torch.cuda.empty_cache()
 
 
         return res_dict
@@ -783,169 +952,7 @@ class HDF5Dataset_multi_frame_idx_changedataloader(Dataset):
 
 
 
-#! multi_frame_idx 多帧加载监督M*3个点，配合collate_fn_pad_less_to_more
-class HDF5Dataset_multi_frame_idx(Dataset):
-    def __init__(self, directory, n_frames, eval = False):
-        '''
-        directory: the directory of the dataset
-        eval: if True, use the eval index
-        '''
-        super(HDF5Dataset_multi_frame_idx, self).__init__()
-        self.directory = directory
-        self.mode = os.path.basename(self.directory)
-        
-        with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
-            self.data_index = pickle.load(f)
-        # self.data_index = sorted(self.data_index) # sorted for debug
 
-        with open('/data0/code/Flow4D_diff_less_to_more/conf/labeling.yaml', 'r') as file:
-            labeling_map = yaml.safe_load(file)
-
-        self.learning_map = labeling_map['Argoverse_learning_map']
-
-        self.n_frames = n_frames
-        assert self.n_frames >= 2, "n_frames must be 2 or more."
-        
-        print('dataloader mode = {} num_frames = {}'.format(self.mode, self.n_frames))
-
-        self.eval_index = False
-        if eval:
-            if not os.path.exists(os.path.join(self.directory, 'index_eval.pkl')):
-                raise Exception(f"No eval index file found! Please check {self.directory}")
-            self.eval_index = eval
-
-            if self.mode == 'val':
-                with open(os.path.join(self.directory, 'index_eval.pkl'), 'rb') as f:
-                    self.eval_data_index = pickle.load(f)
-            elif self.mode == 'test':
-                with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f: #jy
-                    self.eval_data_index = pickle.load(f)
-            else:
-                raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
-
-        self.scene_id_bounds = {}  # 存储每个scene_id的最大最小timestamp和位置
-        for idx, (scene_id, timestamp) in enumerate(self.data_index):
-            if scene_id not in self.scene_id_bounds:
-                self.scene_id_bounds[scene_id] = {
-                    "min_timestamp": timestamp,
-                    "max_timestamp": timestamp,
-                    "min_index": idx,
-                    "max_index": idx
-                }
-            else:
-                bounds = self.scene_id_bounds[scene_id]
-                # 更新最小timestamp和位置
-                if timestamp < bounds["min_timestamp"]:
-                    bounds["min_timestamp"] = timestamp
-                    bounds["min_index"] = idx
-                # 更新最大timestamp和位置
-                if timestamp > bounds["max_timestamp"]:
-                    bounds["max_timestamp"] = timestamp
-                    bounds["max_index"] = idx
-
-    def __len__(self):
-        if self.eval_index:
-            return len(self.eval_data_index)
-        return len(self.data_index)
-    
-    def __getitem__(self, index_):
-        if self.eval_index:
-            scene_id, timestamp = self.eval_data_index[index_]
-            # find this one index in the total index
-            index_ = self.data_index.index([scene_id, timestamp]) 
-        else:
-            scene_id, timestamp = self.data_index[index_] 
-            # to make sure we have continuous frames
-            if (self.scene_id_bounds[scene_id]["max_index"] - 1) <= index_: #! 因为最后一阵没有target_mask
-                index_ = index_ - 2
-            scene_id, timestamp = self.data_index[index_] 
-
-        key = str(timestamp)
-        with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f: 
-            pc0 = torch.tensor(f[key]['lidar'][:]) 
-            gm0 = torch.tensor(f[key]['ground_mask'][:]) 
-            pose0 = torch.tensor(f[key]['pose'][:]) 
-            pc0_valid = torch.tensor(f[key]['point_valid'][:]) 
-
-            if self.scene_id_bounds[scene_id]["max_index"] == index_: 
-                return self.__getitem__(index_ + 1)
-            else:
-                next_timestamp = str(self.data_index[index_+1][1])
-
-            pc1 = torch.tensor(f[next_timestamp]['lidar'][:])
-            gm1 = torch.tensor(f[next_timestamp]['ground_mask'][:]) 
-            pose1 = torch.tensor(f[next_timestamp]['pose'][:])
-            pc1_valid = torch.tensor(f[next_timestamp]['point_valid'][:]) 
-
-
-            res_dict = {
-                'scene_id': scene_id,
-                'timestamp': key,
-                'pc0': pc0, #current
-                'gm0': gm0, #current
-                'pose0': pose0, #current
-                'pc0_valid': pc0_valid, #current
-                'pc1': pc1, #nect
-                'gm1': gm1, #next
-                'pose1': pose1, #next
-                'pc1_valid': pc1_valid, #next
-            }
-
-
-            if self.n_frames > 2: 
-                past_frames = []
-                num_past_frames = self.n_frames - 2  
-
-                for i in range(1, num_past_frames + 1):
-                    frame_index = index_ - i
-                    if frame_index < self.scene_id_bounds[scene_id]["min_index"]: 
-                        frame_index = self.scene_id_bounds[scene_id]["min_index"] 
-
-                    past_timestamp = str(self.data_index[frame_index][1])
-                    past_pc = torch.tensor(f[past_timestamp]['lidar'][:])
-                    past_gm = torch.tensor(f[past_timestamp]['ground_mask'][:])
-                    past_pose = torch.tensor(f[past_timestamp]['pose'][:])
-
-                    past_frames.append((past_pc, past_gm, past_pose))
-
-                for i, (past_pc, past_gm, past_pose) in enumerate(past_frames):
-                    res_dict[f'pc_m{i+1}'] = past_pc
-                    res_dict[f'gm_m{i+1}'] = past_gm
-                    res_dict[f'pose_m{i+1}'] = past_pose
-
-            if 'flow' in f[key]:
-                flow = torch.tensor(f[key]['flow'][:])
-                flow_is_valid = torch.tensor(f[key]['flow_is_valid'][:]) 
-                flow_category_indices = torch.tensor(f[key]['flow_category_indices'][:]) 
-                target_mask_pc0 = torch.tensor(f[key]['target_mask'][:]) 
-                target_mask_pc1 = torch.tensor(f[next_timestamp]['target_mask'][:]) #! pc1_mask
-                class_valid = torch.tensor(f[key]['class_valid'][:]) 
-                res_dict['flow'] = flow
-                res_dict['flow_is_valid'] = flow_is_valid
-                res_dict['flow_category_indices'] = flow_category_indices
-                res_dict['target_mask_pc0'] = target_mask_pc0
-                res_dict['target_mask_pc1'] = target_mask_pc1
-                res_dict['class_valid'] = class_valid
-                flow_category_labeled = map_label(f[key]['flow_category_indices'][:], self.learning_map) 
-                flow_category_labeled_tensor = torch.tensor(flow_category_labeled, dtype=torch.int32)
-                res_dict['flow_category_labeled'] = flow_category_labeled_tensor 
-
-            if 'ego_motion' in f[key]:
-                ego_motion = torch.tensor(f[key]['ego_motion'][:])
-                res_dict['ego_motion'] = ego_motion
-
-
-            if self.eval_index: 
-                if self.mode == 'val':
-                    eval_mask = torch.tensor(f[key]['eval_mask'][:])
-                    res_dict['eval_mask'] = eval_mask 
-                elif self.mode == 'test':
-                    eval_mask = torch.ones(pc0.shape[0], 1, dtype=torch.bool) 
-                    res_dict['eval_mask'] = eval_mask
-                else:
-                    raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
-
-        return res_dict
 
 
 class HDF5Dataset_onlybox_multiframe(Dataset):
