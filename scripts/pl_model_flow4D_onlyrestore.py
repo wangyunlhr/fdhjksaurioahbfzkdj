@@ -116,6 +116,44 @@ class ModelWrapper(LightningModule):
         self.save_hyperparameters()
 
 
+
+    def fast_chamfer(self, A, B, truncate_dist=None):
+        """
+        计算 Chamfer 距离，适用于 (N, K, 3) 结构，并支持距离截断。
+
+        A: (N, K, 3) - 第一个点云
+        B: (N, K, 3) - 第二个点云
+        truncate_dist: float, 如果不为 None,则截断距离超过该值的点对
+        返回值: (N,) - 每个 voxel 内的 Chamfer 距离
+        """
+        # 计算点到点的欧式距离
+        dist_mat = torch.cdist(A, B, p=2)  # (N, K, K)，每个 voxel 内 K 个点的距离矩阵
+
+        if truncate_dist is not None:
+            # 设定截断：超过 `truncate_dist` 的距离设为无效（inf）
+            dist_mat = torch.where(dist_mat > truncate_dist, torch.tensor(float('inf'), device=dist_mat.device), dist_mat)
+
+        # 每个点找到最近的匹配点
+        min_dist_A_to_B, _ = torch.min(dist_mat, dim=2)  # (N, K)
+        min_dist_B_to_A, _ = torch.min(dist_mat, dim=1)  # (N, K)
+
+        if truncate_dist is not None:
+            # 只计算有效的（非 `inf`）距离
+            valid_A = min_dist_A_to_B != float('inf')
+            valid_B = min_dist_B_to_A != float('inf')
+
+            chamfer_A = torch.where(valid_A, min_dist_A_to_B, torch.tensor(0.0, device=A.device)).sum(dim=1) / valid_A.sum(dim=1).clamp(min=1)
+            chamfer_B = torch.where(valid_B, min_dist_B_to_A, torch.tensor(0.0, device=A.device)).sum(dim=1) / valid_B.sum(dim=1).clamp(min=1)
+
+            chamfer_dist = chamfer_A + chamfer_B  # (N,)
+        else:
+            # 直接计算 Chamfer 距离（无截断）
+            chamfer_dist = min_dist_A_to_B.mean(dim=1) + min_dist_B_to_A.mean(dim=1)  # (N,)
+
+        return chamfer_dist
+
+
+
     def training_step(self, batch, batch_idx):
         self.model.timer[4].start("One Scan in model")
         res_dict = self.model(batch, True)
@@ -157,7 +195,8 @@ class ModelWrapper(LightningModule):
 
             loss = compute_class_loss(pred_point = restore_point_valid, gt_point = gt_point_valid, category_indices = gt_class_valid)
             #! change loss
-            est_dist0, est_dist1, _, _ = MyCUDAChamferDis.disid_res(restore_point_valid[:5,:], gt_point_valid[:5])
+            chamferdis = self.fast_chamfer(restore_point_valid.reshape(-1, 5, 3), gt_point_valid.reshape(-1, 5, 3), 4.0)
+
             # loss_restore1 = self.loss_fn_restore(restore_loss_list[batch_id])
             # loss_restore2 = self.loss_fn_restore(restore_loss_list[batch_id + batch_sizes])
             # total_flow_loss += loss.item()
