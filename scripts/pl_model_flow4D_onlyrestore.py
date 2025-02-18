@@ -24,7 +24,7 @@ import os, sys, time, h5py
 BASE_DIR = os.path.abspath(os.path.join( os.path.dirname( __file__ ), '..' ))
 sys.path.append(BASE_DIR)
 from scripts.utils.mics import import_func, weights_init, zip_res
-from scripts.utils.av2_eval import write_output_file, write_output_file_2023, write_output_file_v2, compute_class_loss, compute_point_epe
+from scripts.utils.av2_eval import write_output_file, write_output_file_2023, write_output_file_v2, compute_class_loss, compute_point_epe, compute_chamfer_epe
 from scripts.network.models.basic import cal_pose0to1
 from scripts.network.official_metric import PointMetrics, evaluate_leaderboard, evaluate_leaderboard_v2
 from assets.cuda.chamfer3D import nnChamferDis
@@ -216,6 +216,7 @@ class ModelWrapper(LightningModule):
         # self.model.timer.print(random_colors=False, bold=False)
         return total_loss
 
+#! 修改成chamfer指标
     def train_validation_step_(self, batch, res_dict): 
         # means there are ground truth flow so we can evaluate the EPE-3 Way metric
         # if batch['flow'][0].shape[0] > 0:
@@ -241,7 +242,13 @@ class ModelWrapper(LightningModule):
             assert gt_class_valid.shape[0] == restore_point_valid.shape[0]
 
 
-            point_dict = compute_point_epe(
+            # point_dict = compute_point_epe(
+            #     restore_point_valid.detach().cpu().numpy().astype(float),
+            #     gt_point_valid.detach().cpu().numpy().astype(float),
+            #     gt_class_valid.detach().cpu().numpy().astype(np.uint8),
+            # )
+            #! change to chamfer_epe
+            point_dict = compute_chamfer_epe(
                 restore_point_valid.detach().cpu().numpy().astype(float),
                 gt_point_valid.detach().cpu().numpy().astype(float),
                 gt_class_valid.detach().cpu().numpy().astype(np.uint8),
@@ -249,7 +256,7 @@ class ModelWrapper(LightningModule):
             self.metrics.step(point_dict)
         else:
             pass
-        
+
     def on_validation_epoch_end(self):
         self.model.timer.print(random_colors=False, bold=False)
 

@@ -898,6 +898,74 @@ def compute_point_epe(
 
 
 
+def chamfer_epe_np(A, B, truncate_dist=None):
+    """
+    计算 Chamfer 距离，适用于 (N, K, 3) 结构，NumPy 版本。
+    
+    A: (N, K, 3) - 第一个点云 (NumPy 数组)
+    B: (N, K, 3) - 第二个点云 (NumPy 数组)
+    truncate_dist: float, 如果不为 None, 则截断距离超过该值的点对
+    返回值: (N,) - 每个 voxel 内的 Chamfer 距离 (NumPy 数组)
+    """
+    # 计算点到点的欧式距离 (N, K, K)
+    dist_mat = np.linalg.norm(A[:, :, np.newaxis, :] - B[:, np.newaxis, :, :], axis=-1)  # Euclidean distance
+
+    if truncate_dist is not None:
+        # 设定截断：超过 `truncate_dist` 的距离设为无效（inf）
+        dist_mat[dist_mat > truncate_dist] = np.inf
+
+    # 找到最近匹配点的距离
+    min_dist_A_to_B = np.min(dist_mat, axis=2)  # (N, K)
+    min_dist_B_to_A = np.min(dist_mat, axis=1)  # (N, K)
+
+    if truncate_dist is not None:
+        # 只计算有效的（非 `inf`）距离
+        valid_A = min_dist_A_to_B != np.inf
+        valid_B = min_dist_B_to_A != np.inf
+
+        chamfer_A = np.where(valid_A, min_dist_A_to_B, 0.0).sum(axis=1) / np.maximum(valid_A.sum(axis=1), 1)
+        chamfer_B = np.where(valid_B, min_dist_B_to_A, 0.0).sum(axis=1) / np.maximum(valid_B.sum(axis=1), 1)
+
+        chamfer_dist = chamfer_A + chamfer_B  # (N,)
+    else:
+        # 直接计算 Chamfer 距离（无截断）
+        chamfer_dist = min_dist_A_to_B.mean(axis=1) + min_dist_B_to_A.mean(axis=1)  # (N,)
+
+    return chamfer_dist
+
+
+
+
+def compute_chamfer_epe(
+    pred_flow: NDArrayFloat,
+    gt_flow: NDArrayFloat,
+    category_indices: NDArrayInt,
+    # is_valid: NDArrayBool,
+):
+    storage_error_matrix = []
+    # bucket_max_speed, num_buckets, distance_thresholds set is from: eval/bucketed_epe.py#L226
+    # bucket_edges = np.concatenate([np.linspace(0, 2.0, 51), [np.inf]])
+    # speed_thresholds = list(zip(bucket_edges, bucket_edges[1:]))
+
+    # gt_speeds = np.linalg.norm(gt_flow, axis=-1)
+    # error_flow = np.linalg.norm(pred_flow - gt_flow, axis=-1)
+    # based on each category, compute the epe
+    for cats_name in BUCKETED_METACATAGORIES:
+        selected_classes_ids = [CATEGORY_TO_INDEX[cat] for cat in BUCKETED_METACATAGORIES[cats_name]] #!对应到大类上
+        cat_mask = np.isin(category_indices, np.array(selected_classes_ids))
+        # since background don't have speed, we just compute the average epe
+        count_pts = cat_mask.sum()
+        if count_pts == 0:
+            continue
+        cat_pred = pred_flow[cat_mask].reshape(-1, 5, 3)
+        cat_gt = gt_flow[cat_mask].reshape(-1, 5, 3)
+        chamfer_dist = chamfer_epe_np(cat_pred, cat_gt)
+        storage_error_matrix.append(PointSplitValue(cats_name, chamfer_dist.mean(), count_pts))
+
+            
+    return storage_error_matrix
+
+
 
 
 
