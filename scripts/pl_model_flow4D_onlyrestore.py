@@ -76,7 +76,8 @@ class ModelWrapper(LightningModule):
         print('submit_version = {}'.format(self.submit_version))
 
 
-        self.metrics = PointMetrics()
+        self.metrics_cor = PointMetrics()
+        self.metrics_chamfer = PointMetrics()
 
         if 'checkpoint' in cfg:
             self.load_checkpoint_path = cfg.checkpoint
@@ -156,7 +157,7 @@ class ModelWrapper(LightningModule):
 
     def training_step(self, batch, batch_idx):
         self.model.timer[4].start("One Scan in model")
-        res_dict = self.model(batch, True)
+        res_dict = self.model(batch, 'train')
         self.model.timer[4].stop()
 
         self.model.timer[5].start("Loss")
@@ -195,7 +196,7 @@ class ModelWrapper(LightningModule):
 
             loss = compute_class_loss(pred_point = restore_point_valid, gt_point = gt_point_valid, category_indices = gt_class_valid)
             #! change loss
-            chamferdis = self.fast_chamfer(restore_point_valid.reshape(-1, 5, 3), gt_point_valid.reshape(-1, 5, 3), 4.0)
+            # chamferdis = self.fast_chamfer(restore_point_valid.reshape(-1, 5, 3), gt_point_valid.reshape(-1, 5, 3), 4.0)
 
             # loss_restore1 = self.loss_fn_restore(restore_loss_list[batch_id])
             # loss_restore2 = self.loss_fn_restore(restore_loss_list[batch_id + batch_sizes])
@@ -242,18 +243,19 @@ class ModelWrapper(LightningModule):
             assert gt_class_valid.shape[0] == restore_point_valid.shape[0]
 
 
-            # point_dict = compute_point_epe(
-            #     restore_point_valid.detach().cpu().numpy().astype(float),
-            #     gt_point_valid.detach().cpu().numpy().astype(float),
-            #     gt_class_valid.detach().cpu().numpy().astype(np.uint8),
-            # )
-            #! change to chamfer_epe
-            point_dict = compute_chamfer_epe(
+            point_dict_cor = compute_point_epe(
                 restore_point_valid.detach().cpu().numpy().astype(float),
                 gt_point_valid.detach().cpu().numpy().astype(float),
                 gt_class_valid.detach().cpu().numpy().astype(np.uint8),
             )
-            self.metrics.step(point_dict)
+            #! change to chamfer_epe
+            point_dict_chamfer = compute_chamfer_epe(
+                restore_point_valid.detach().cpu().numpy().astype(float),
+                gt_point_valid.detach().cpu().numpy().astype(float),
+                gt_class_valid.detach().cpu().numpy().astype(np.uint8),
+            )
+            self.metrics_cor.step(point_dict_cor)
+            self.metrics_chamfer.step(point_dict_chamfer)
         else:
             pass
 
@@ -269,51 +271,68 @@ class ModelWrapper(LightningModule):
             print(f"\nModel: {self.model.__class__.__name__}, Checkpoint from: {self.load_checkpoint_path}")
             print(f"More details parameters and training status are in checkpoints")        
 
-        self.metrics.normalize()
+        self.metrics_chamfer.normalize()
+        self.metrics_cor.normalize()
 
         # wandb log things:
-        for key in self.metrics.point_bag:
-            self.log(f"val/{key}", self.metrics.point_bag[key], sync_dist=True)
+        for key in self.metrics_chamfer.point_bag:
+            self.log(f"val/{key}", self.metrics_chamfer.point_bag[key], sync_dist=True)
+        for key in self.metrics_cor.point_bag:
+            self.log(f"val/{key}_cor", self.metrics_cor.point_bag[key], sync_dist=True)
+
+        print("________chamfer________")
+        self.metrics_chamfer.print()
+        self.metrics_chamfer = PointMetrics()
         
-        self.metrics.print()
-        self.metrics = PointMetrics()
+        print("________cor________")
+        self.metrics_cor.print()
+        self.metrics_cor = PointMetrics()
         
     def eval_only_step_(self, batch, res_dict):
-        batch = {key: batch[key][0] for key in batch if len(batch[key])>0}
-        res_dict = {key: res_dict[key][0] for key in res_dict if len(res_dict[key])>0}
-
-        eval_mask = batch['eval_mask'].squeeze()
-        pc0 = batch['origin_pc0']
-        pose_0to1 = cal_pose0to1(batch["pose0"], batch["pose1"])
-        transform_pc0 = pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
-        pose_flow = transform_pc0 - pc0
-
-        if 'pc0_valid_point_idxes' in res_dict:
-            if self.av2_mode == 'val':
-                valid_from_pc2res = res_dict['pc0_valid_point_idxes'] 
-                # flow in the original pc0 coordinate
-                pred_flow = pose_flow[~batch['gm0']].clone() 
-                pred_flow[valid_from_pc2res] = pose_flow[~batch['gm0']][valid_from_pc2res] + res_dict['flow']
-                final_flow = pose_flow.clone() 
-                final_flow[~batch['gm0']] = pred_flow 
-            elif self.av2_mode == 'test':
-                valid_from_pc2res = res_dict['pc0_valid_point_idxes']
-                pred_flow = torch.zeros_like(pose_flow[~batch['gm0']])
-                final_flow = torch.zeros_like(pose_flow)
-
-                pred_flow[valid_from_pc2res] = res_dict['flow']
-                final_flow[~batch['gm0']] = pred_flow
+        batch_sizes = len(batch["pose0"])
+        # restore_all_dict = {'pc0s_restore': restore_pc0_all, 'pc1s_restore': restore_pc1_all, \
+        #             'pc0s_gt': batch["pc0_all"].reshape(batch_sizes,-1,3),
+        #             'pc1s_gt': batch["pc1_all"].reshape(batch_sizes,-1,3),
+        #             }
+        pc0s_restore = res_dict['pc0s_restore']
+        pc0s_gt = res_dict['pc0s_gt']
+        for batch_id, gt_flow in enumerate(batch["flow"]):
+            restore_point = pc0s_restore[batch_id]
+            restore_not_nan_mask = ~torch.isnan(restore_point).any(dim=1)
+            restore_point_valid = restore_point[restore_not_nan_mask]
+            gt_point = pc0s_gt[batch_id]
+            gt_not_nan_mask = ~torch.isnan(gt_point).any(dim=1)
+            gt_point_valid = gt_point[gt_not_nan_mask]
+            assert torch.equal(restore_not_nan_mask, gt_not_nan_mask)
+            gt_class = batch['flow_category_indices'][batch_id]
+            class_not_nan_mask = ~ (gt_class == 255)
+            gt_class_valid = gt_class[class_not_nan_mask].unsqueeze(1).repeat(1, 5).reshape(-1)
+            assert gt_class_valid.shape[0] == restore_point_valid.shape[0]
 
 
-        if self.av2_mode == 'val': 
-            gt_flow = batch["flow"] 
-            v1_dict = evaluate_leaderboard(final_flow[eval_mask], pose_flow[eval_mask], pc0[eval_mask], \
-                                       gt_flow[eval_mask], batch['flow_is_valid'][eval_mask], \
-                                       batch['flow_category_indices'][eval_mask])
-            v2_dict = evaluate_leaderboard_v2(final_flow[eval_mask], pose_flow[eval_mask], pc0[eval_mask], \
-                                    gt_flow[eval_mask], batch['flow_is_valid'][eval_mask], batch['flow_category_indices'][eval_mask])
+            point_dict_cor = compute_point_epe(
+                restore_point_valid.detach().cpu().numpy().astype(float),
+                gt_point_valid.detach().cpu().numpy().astype(float),
+                gt_class_valid.detach().cpu().numpy().astype(np.uint8),
+            )
+            #! change to chamfer_epe
+            point_dict_chamfer = compute_chamfer_epe(
+                restore_point_valid.detach().cpu().numpy().astype(float),
+                gt_point_valid.detach().cpu().numpy().astype(float),
+                gt_class_valid.detach().cpu().numpy().astype(np.uint8),
+            )
+            self.metrics_cor.step(point_dict_cor)
+            self.metrics_chamfer.step(point_dict_chamfer)
+
+        # if self.av2_mode == 'val': 
+        #     gt_flow = batch["flow"] 
+        #     v1_dict = evaluate_leaderboard(final_flow[eval_mask], pose_flow[eval_mask], pc0[eval_mask], \
+        #                                gt_flow[eval_mask], batch['flow_is_valid'][eval_mask], \
+        #                                batch['flow_category_indices'][eval_mask])
+        #     v2_dict = evaluate_leaderboard_v2(final_flow[eval_mask], pose_flow[eval_mask], pc0[eval_mask], \
+        #                             gt_flow[eval_mask], batch['flow_is_valid'][eval_mask], batch['flow_category_indices'][eval_mask])
             
-            self.metrics.step(v1_dict, v2_dict)
+        #     self.metrics.step(v1_dict, v2_dict)
 
 
         
@@ -333,9 +352,11 @@ class ModelWrapper(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         if self.av2_mode == 'val' or self.av2_mode == 'test':
-            batch['origin_pc0'] = batch['pc0'].clone()
-            batch['pc0'] = batch['pc0'][~batch['gm0']].unsqueeze(0)
-            batch['pc1'] = batch['pc1'][~batch['gm1']].unsqueeze(0)
+            batch['pc0_all'] = batch['pc0_neighbor']
+            batch['timestamps'] = batch['timestamp']
+            batch["scene_ids"] = batch["scene_id"]
+            pc0_one_mask = batch['pc0_all_to_sparse_idx'].to(torch.long)
+            batch['flow_category_indices'] = batch['flow_category_indices'][0][pc0_one_mask[0]].unsqueeze(0)
 
             num_frames = 2
             while f'pc_m{num_frames - 1}' in batch:
@@ -345,11 +366,11 @@ class ModelWrapper(LightningModule):
                 batch[f'pc_m{j}'] = batch[f'pc_m{j}'][~batch[f'gm_m{j}']].unsqueeze(0)
 
             self.model.timer[12].start("One Scan")
-            res_dict = self.model(batch, False)
+            res_dict = self.model(batch, 'test')
             self.model.timer[12].stop()
             self.eval_only_step_(batch, res_dict)
         else:
-            res_dict = self.model(batch, False)
+            res_dict = self.model(batch, 'val')
             self.train_validation_step_(batch, res_dict)
 
     def configure_optimizers(self):
