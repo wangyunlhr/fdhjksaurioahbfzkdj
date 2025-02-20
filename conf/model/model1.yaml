@@ -1,7 +1,7 @@
-name: flow4D
+name: model1
 
 target:
-  _target_: scripts.network.models.flow4D_ori_multi.CombinedModel
+  _target_: scripts.network.models.flow4D_NK_combine1.Flow4D
   voxel_size: ${voxel_size}
   point_cloud_range: ${point_cloud_range}
   num_frames: ${num_frames}
