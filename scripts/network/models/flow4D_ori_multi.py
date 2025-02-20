@@ -28,7 +28,7 @@ def replace_feature(out, new_features):
         return out
     
 
-class Flow4D(nn.Module):
+class Flow4D_forflow(nn.Module):
     def __init__(self, voxel_size = [0.2, 0.2, 0.2],
                  point_cloud_range = [-51.2, -51.2, -2.2, 51.2, 51.2, 4.2],
                  grid_feature_size = [512, 512, 32],
@@ -63,7 +63,7 @@ class Flow4D(nn.Module):
         print("\nLoading... model weight from: ", ckpt_path, "\n")
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
-    def forward(self, batch, trainflag):
+    def forward(self, batch):
         #t_deflow_start = time.time()
         """
         input: using the batch from dataloader, which is a dict
