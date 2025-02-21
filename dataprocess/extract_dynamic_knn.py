@@ -34,17 +34,32 @@ from collections import defaultdict
 import pickle
 from zipfile import ZipFile
 import pandas as pd
+import torch
 
 import os, sys
 BASE_DIR = os.path.abspath(os.path.join( os.path.dirname( __file__ ), '..' ))
 sys.path.append(BASE_DIR)
 from dataprocess.misc_data import create_reading_index
+from scripts.network.models.basic.make_voxels import DynamicVoxelizer
+
 
 BOUNDING_BOX_EXPANSION: Final = 0.2
 CATEGORY_TO_INDEX: Final = {
     **{"NONE": 0},
     **{k.value: i + 1 for i, k in enumerate(AnnotationCategories)},
 }
+
+
+#! 全局voxel参数化定义
+voxel_size = [0.2, 0.2, 0.2]
+point_cloud_range = [-51.2, -51.2, -2.2, 51.2, 51.2, 4.2]
+grid_feature_size = [512, 512, 32]
+voxel_size_32 = [v * 32 for v in voxel_size]
+voxel_spatial_shape_32 = [int(v / 32) for v in grid_feature_size]
+
+# **只初始化一次**
+global_voxelizer = DynamicVoxelizer(voxel_size=voxel_size_32, point_cloud_range=point_cloud_range)
+
 
 def create_eval_mask(data_mode: str, output_dir_: Path, mask_dir: str):
     """
@@ -311,23 +326,198 @@ def compute_sceneflow(data_dir: Path, log_id: str, timestamps: Tuple[int, int], 
     return {'acc_pc0': point_cat, 'flow_0_1': flows_cat, 'classes_0': classes_cat,
             'valid_flow_0': valid_flow_cat, 'valid_point': valid_point_cat, 'ground_point': ground_point_cat, 
             'target_mask': target_mask_cat, 'ego_motion': ego1_SE3_ego0, 'class_valid': class_valid_cat}
-def process_log(data_dir: Path, log_id: str, output_dir: Path, multi_frame: int, n: Optional[int] = None) :
 
-    def create_group_data(group, pc, pose, point_valid, gm, target_mask=None, flow_0to1=None, 
-                          flow_valid=None, flow_category=None, ego_motion=None, class_valid=None):
+def fast_knn_gpu_9_idx(sparse_points, sparse_voxels, dense_points, dense_voxels, K):
+    """
+    以 Voxel 为基准，使用 PyTorch GPU 进行高效 KNN 搜索，
+    每个稀疏点在水平方向 (xy) 附近体素内找到最近的 K 个稠密点，返回索引。
+
+    Returns:
+        torch.Tensor: (N, K) 形状的 Tensor,存放在 GPU 上，表示最近邻的索引。
+    """
+    device = sparse_points.device
+    N, M = sparse_points.shape[0], dense_points.shape[0]
+
+    # 1. 计算 Voxel 索引 #! voxel coor 是 zyx
+    voxel_spatial_shape = voxel_spatial_shape_32  
+    sparse_voxel_keys = (sparse_voxels[:, 0] * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+                        sparse_voxels[:, 1] * voxel_spatial_shape[0] + sparse_voxels[:, 2])
+    dense_voxel_keys = (dense_voxels[:, 0] * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+                        dense_voxels[:, 1] * voxel_spatial_shape[0] + dense_voxels[:, 2])
+
+    # 2. 获取唯一的 sparse_voxel_keys 和其索引
+    unique_sparse_voxels, inverse_indices = torch.unique(sparse_voxels, return_inverse=True, dim=0)
+    # 返回 原始 sparse_voxels 里的每个体素对应 unique_sparse_voxels 的索引
+    # 形状是 (N,)，表示 sparse_voxels[i] 对应 unique_sparse_voxels[inverse_indices[i]]
+
+    # 3. 计算所有 (dx, dy) 偏移的 9 邻域
+    neighbor_shifts = torch.tensor([
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1), (0, 0), (0, 1),
+        (1, -1), (1, 0), (1, 1)
+    ], device=device, dtype=torch.int32)  # (9, 2)
+
+    # 4. **一次性计算所有 unique sparse 的 9 邻域**
+    new_voxels_x = unique_sparse_voxels[:, 2].unsqueeze(1) + neighbor_shifts[:, 0]  # (U, 9)  x
+    new_voxels_y = unique_sparse_voxels[:, 1].unsqueeze(1) + neighbor_shifts[:, 1]  # (U, 9)  y
+
+    # 5. **计算合法 mask，确保 x 和 y 在范围内**
+    valid_mask = (new_voxels_x >= 0) & (new_voxels_x < voxel_spatial_shape[0]) & \
+                (new_voxels_y >= 0) & (new_voxels_y < voxel_spatial_shape[1])
+
+    # 6. **计算新的 voxel key**
+    expanded_sparse_voxel_keys = (
+        unique_sparse_voxels[:, 0].unsqueeze(1) * voxel_spatial_shape[0] * voxel_spatial_shape[1] +
+        new_voxels_y * voxel_spatial_shape[0] + new_voxels_x
+    )  # (U, 9)
+
+    # 7. **仅保留合法的 voxel keys**
+    expanded_sparse_voxel_keys = expanded_sparse_voxel_keys[valid_mask]
+
+    # 8. **计算每个 unique sparse voxel 的实际邻域数**
+    num_valid_neighbors = valid_mask.sum(dim=1)  # (U,)
+    neighbor_offsets = torch.cat([torch.tensor([0], device=device), num_valid_neighbors.cumsum(dim=0)])
+
+    # 9. 对 Dense Voxel 进行排序
+    dense_sorted_indices = torch.argsort(dense_voxel_keys)
+    sorted_dense_keys = dense_voxel_keys[dense_sorted_indices]
+
+    # 使用二分查找 (torch.searchsorted) 在 sorted_dense_keys 中找到 expanded_sparse_voxel_keys 的起始和结束索引
+    voxel_start_idx = torch.searchsorted(sorted_dense_keys, expanded_sparse_voxel_keys)
+    voxel_end_idx = torch.searchsorted(sorted_dense_keys, expanded_sparse_voxel_keys, side="right")
+
+    # 11. 预分配 (N, K) 形状的索引 Tensor
+    results = torch.full((N, K), -1, device=device, dtype=torch.long)  # -1 作为无效索引填充
+
+    # 12. **并行 KNN 计算**
+    for i in range(len(unique_sparse_voxels)):
+        sparse_indices = torch.where(inverse_indices == i)[0]  # 当前 voxel 内所有 sparse 点索引
+        sparse_pts = sparse_points[sparse_indices]  # (Nsparse, 3)
+
+        # 获取实际邻域范围
+        start_idx_list = voxel_start_idx[neighbor_offsets[i]:neighbor_offsets[i+1]]
+        end_idx_list = voxel_end_idx[neighbor_offsets[i]:neighbor_offsets[i+1]]
+
+        dense_indices = torch.cat([dense_sorted_indices[start:end] for start, end in zip(start_idx_list, end_idx_list)])
+
+        if len(dense_indices) > 0:
+            dense_pts = dense_points[dense_indices]  # (Ndense, 3)
+
+            # **计算 KNN**
+            distances = torch.cdist(sparse_pts, dense_pts)  # (Nsparse, Ndense)
+            knn_indices = distances.topk(k=min(K, len(dense_pts)), dim=1, largest=False).indices  # 取最近 K 个
+
+            # **填充 K 个邻居**
+            num_neighbors = knn_indices.shape[1]
+            if num_neighbors < K:
+                repeat_indices = torch.randint(0, num_neighbors, (K - num_neighbors,), device=device)
+                knn_indices = torch.cat([knn_indices, knn_indices[:, repeat_indices]], dim=1)
+
+            # **存储索引**
+            results[sparse_indices] = dense_indices[knn_indices]  # 存储的是 dense 点的全局索引
+
+    return results 
+
+def sparse_to_dense(data_dict, neighbor_num, flow_flag):
+
+    pc0 = torch.tensor(data_dict['acc_pc0'][:], dtype=torch.float32) #累积后的点云
+    gm0 = torch.tensor(data_dict['ground_point'][:], dtype=torch.bool) #地面点mask
+    pc0_valid = torch.tensor(data_dict['valid_point'][:], dtype=torch.bool) #有效点云
+
+
+    #! 只用修改单帧
+    pc0_valid_mask = (~gm0 & pc0_valid) #有效的pc0_all mask
+    target_mask_pc0 = torch.tensor(data_dict['target_mask'][:], dtype=torch.bool) 
+
+    pc0_origin = pc0[target_mask_pc0]
+    pc0_gm0_origin = gm0[target_mask_pc0]
+    pc0_all = pc0[pc0_valid_mask][None].cuda()
+    pc0_one = pc0_origin[~pc0_gm0_origin][None].cuda()
+
+    voxel_info_dict_all = global_voxelizer(pc0_all)
+    voxel_info_dict_all_sparse = global_voxelizer(pc0_one)
+    #
+    points_all = voxel_info_dict_all[0]['points']
+    coordinates_all = voxel_info_dict_all[0]['voxel_coords'] #! z,y,x
+    point_idxes_all = voxel_info_dict_all[0]['point_idxes']
+    #
+    points_sparse = voxel_info_dict_all_sparse[0]['points']
+    coordinates_sparse = voxel_info_dict_all_sparse[0]['voxel_coords'] #! z,y,x
+    point_idxes_sparse = voxel_info_dict_all_sparse[0]['point_idxes']
+
+
+    neighbor_idx = fast_knn_gpu_9_idx(points_sparse, coordinates_sparse, points_all, coordinates_all, neighbor_num) # N,K,3
+    # 稀疏点的邻居信息
+    neighbor_point = points_all[neighbor_idx]
+    indices_A_to_C_all = point_idxes_all[neighbor_idx]
+    assert torch.allclose(points_all[neighbor_idx], pc0_all[0][indices_A_to_C_all])
+    indices_A_to_B = (~pc0_gm0_origin).nonzero(as_tuple=True)[0]
+    indices_A_to_C = indices_A_to_B[point_idxes_sparse.cpu()]
+    assert torch.allclose(points_sparse, pc0_one[0][indices_A_to_C])
+    
+    if flow_flag:
+        #! flow class 的有效mask
+        flow_another_mask = torch.tensor(data_dict['class_valid'][:], dtype=torch.bool)
+        flow_is_valid = torch.tensor(data_dict['valid_flow_0'][:], dtype=torch.bool)
+        flow_final_mask = flow_is_valid & flow_another_mask #有效的flow mask
+
+        flow_masks_all = flow_final_mask[point_idxes_all].cuda()
+        flow_value_all = data_dict['flow_0_1'][point_idxes_all].cuda()
+        flow_category_all = data_dict['classes_0'][point_idxes_all].cuda()
+
+        neighbor_flow_valid = flow_masks_all[neighbor_idx]
+        neighbor_flow = flow_value_all[neighbor_idx]
+        neighbor_flow_category = flow_category_all[neighbor_idx]
+        return {'neighbor_point': neighbor_point, 'indices_A_to_C': indices_A_to_C,
+                'neighbor_flow_valid': neighbor_flow_valid, 'neighbor_flow': neighbor_flow,
+                'neighbor_flow_category': neighbor_flow_category}
+    else:
+        return {'neighbor_point': neighbor_point, 'indices_A_to_C': indices_A_to_C}
+
+
+
+def all_to_one(data_dict, flow_flag):
+    #! 单帧
+    target_mask_pc0 = data_dict['target_mask']
+    target_point = data_dict['acc_pc0'][target_mask_pc0]
+    target_point_ground = data_dict['ground_point'][target_mask_pc0]
+    if flow_flag:
+        target_flow = data_dict['flow_0_1'][target_mask_pc0]
+        target_flow_valid = data_dict['valid_flow_0'][target_mask_pc0]
+        target_flow_category = data_dict['classes_0'][target_mask_pc0]
+
+        return {'target_point': target_point, 
+            'target_point_ground': target_point_ground, 'target_flow': target_flow,
+            'target_flow_valid': target_flow_valid, 'target_flow_category': target_flow_category}
+    else:
+        return {'target_point': target_point, 
+            'target_point_ground': target_point_ground}
+
+
+
+
+def process_log(data_dir: Path, log_id: str, output_dir: Path, multi_frame: int, neighbor_num: int, n: Optional[int] = None) :
+
+    def create_group_data(group, target_point, pose, target_ground_mask, neighbor_point, neighbor_a_to_c, neighbor_flow_vaild = None,
+                          neighbor_flow = None, neighbor_flow_category = None,
+                          target_flow = None, target_flow_valid = None, target_flow_category = None,
+                          ego_motion=None):
         # if pc is not None:
-        group.create_dataset('lidar', data=pc.astype(np.float32))
-        group.create_dataset('ground_mask', data=gm.astype(bool))
-        group.create_dataset('point_valid', data=point_valid.astype(bool))
+        group.create_dataset('target_point', data=target_point.astype(np.float32))
+        group.create_dataset('target_ground_mask', data=target_ground_mask.astype(bool))
+        group.create_dataset('neighbor_point', data=neighbor_point.astype(np.float32))
+        group.create_dataset('neighbor_a_to_c', data=neighbor_a_to_c.astype(np.int64))
         group.create_dataset('pose', data=pose.astype(np.float32))
-        group.create_dataset('target_mask', data=target_mask.astype(bool))
-        if flow_0to1 is not None:
+
+        if neighbor_flow_vaild is not None:
             # ground truth flow information
-            group.create_dataset('flow', data=flow_0to1.astype(np.float32))
-            group.create_dataset('flow_is_valid', data=flow_valid.astype(bool))
-            group.create_dataset('flow_category_indices', data=flow_category.astype(np.uint8))
+            group.create_dataset('neighbor_flow', data=neighbor_flow.astype(np.float32))
+            group.create_dataset('neighbor_flow_vaild', data=neighbor_flow_vaild.astype(bool))
+            group.create_dataset('neighbor_flow_category', data=neighbor_flow_category.astype(np.uint8))
+            group.create_dataset('target_flow', data=target_flow.astype(np.float32))
+            group.create_dataset('target_flow_valid', data=target_flow_valid.astype(bool))
+            group.create_dataset('target_flow_category', data=target_flow_category.astype(np.uint8))
             group.create_dataset('ego_motion', data=ego_motion.astype(np.float32))
-            group.create_dataset('class_valid', data=class_valid.astype(bool))
 
     log_map_dirpath = data_dir / log_id / "map"
     if(len(os.listdir(log_map_dirpath))<3):
@@ -361,25 +551,37 @@ def process_log(data_dir: Path, log_id: str, output_dir: Path, multi_frame: int,
             if cnt == len(timestamps) - 1:
                 stage = 'last'
                 scene_flow = compute_sceneflow(data_dir, log_id, timestamps[cnt-multi_frame+1:], avm, stage, ts0)
-                create_group_data(group, scene_flow['acc_pc0'], pose0.transform_matrix.astype(np.float32), 
-                                  scene_flow['valid_point'], scene_flow['ground_point'].astype(np.bool_), scene_flow['target_mask'],)
+                neighbor_info = sparse_to_dense(scene_flow, neighbor_num, False)
+                target = all_to_one(scene_flow, False)
+                create_group_data(group, target['target_point'], pose0.transform_matrix.astype(np.float32), #! change to new_pc0
+                                  target['target_point_ground'].astype(np.bool_),
+                                  neighbor_info['neighbor_point'], neighbor_info['indices_A_to_C']
+                                  )
             else:
                 if cnt < mid_frame:
                     stage = 'start'
                     scene_flow = compute_sceneflow(data_dir, log_id, timestamps[cnt:cnt + multi_frame], avm, stage, ts0)
+                    neighbor_info = sparse_to_dense(scene_flow, neighbor_num, True)
+                    target = all_to_one(scene_flow, True)
                 elif cnt >= len(timestamps) - mid_frame:
                     stage = 'end'
                     scene_flow = compute_sceneflow(data_dir, log_id, timestamps[cnt-multi_frame+2:cnt+2], avm, stage, ts0)
+                    neighbor_info = sparse_to_dense(scene_flow, neighbor_num, True)
+                    target = all_to_one(scene_flow, True)
                 else:
                     stage ='mid'
                     scene_flow = compute_sceneflow(data_dir, log_id, timestamps[cnt-mid_frame:cnt+mid_frame+1], avm, stage, ts0)
-
+                    neighbor_info = sparse_to_dense(scene_flow, neighbor_num, True)
+                    target = all_to_one(scene_flow, True)
                 assert scene_flow['acc_pc0'].shape[0] == scene_flow['class_valid'].shape[0]
-                create_group_data(group, scene_flow['acc_pc0'], pose0.transform_matrix.astype(np.float32), #! change to new_pc0
-                                  scene_flow['valid_point'], scene_flow['ground_point'].astype(np.bool_), scene_flow['target_mask'],
-                                  scene_flow['flow_0_1'], scene_flow['valid_flow_0'], scene_flow['classes_0'],
+                create_group_data(group, target['target_point'], pose0.transform_matrix.astype(np.float32), #! change to new_pc0
+                                  target['target_point_ground'].astype(np.bool_),
+                                  neighbor_info['neighbor_point'], neighbor_info['indices_A_to_C'],
+                                  neighbor_info['neighbor_flow_valid'], neighbor_info['neighbor_flow'],
+                                  neighbor_info['neighbor_flow_category'],
+                                  target['target_flow'], target['target_flow_valid'], target['target_flow_category'],
                                   scene_flow['ego_motion'].transform_matrix.astype(np.float32),
-                                  scene_flow['class_valid'])
+                                  )
 
 def proc(x, ignore_current_process=False):
     if not ignore_current_process:
@@ -389,7 +591,7 @@ def proc(x, ignore_current_process=False):
         pos = 1
     process_log(*x, n=pos)
     
-def process_logs(data_dir: Path, output_dir: Path, nproc: int, multi_frame: int):
+def process_logs(data_dir: Path, output_dir: Path, nproc: int, multi_frame: int, neighbor_num: int):
     """Compute sceneflow for all logs in the dataset. Logs are processed in parallel.
        Args:
          data_dir: Argoverse 2.0 directory
@@ -402,18 +604,18 @@ def process_logs(data_dir: Path, output_dir: Path, nproc: int, multi_frame: int)
     
     # NOTE(Qingwen): if you don't want to all data_dir, then change here: logs = logs[:10] only 10 scene.
     logs = os.listdir(data_dir)
-    args = sorted([(data_dir, log, output_dir,  multi_frame) for log in logs])
+    args = sorted([(data_dir, log, output_dir,  multi_frame, neighbor_num) for log in logs])
     print(f'Using {nproc} processes to process data: {data_dir} to .h5 format. (#scenes: {len(args)})')
     # #! for debug
-    # for x in tqdm(args):
-    #     proc(x, ignore_current_process=True)
-    #     break
-    if nproc <= 1:
-        for x in tqdm(args, ncols=120):
-            proc(x, ignore_current_process=True)
-    else:
-        with Pool(processes=nproc) as p:
-            res = list(tqdm(p.imap_unordered(proc, args), total=len(logs), ncols=120))
+    for x in tqdm(args):
+        proc(x, ignore_current_process=True)
+        break
+    # if nproc <= 1:
+    #     for x in tqdm(args, ncols=120):
+    #         proc(x, ignore_current_process=True)
+    # else:
+    #     with Pool(processes=nproc) as p:
+    #         res = list(tqdm(p.imap_unordered(proc, args), total=len(logs), ncols=120))
 
 def main(
     argo_dir: str = "/data0/dataset/av2",
@@ -422,12 +624,13 @@ def main(
     data_mode: str = "val",
     mask_dir: str = "/data0/dataset/av2/eval_mask",
     multi_frame: int = 5,
+    neighbor_num: int = 16,
     nproc: int = (multiprocessing.cpu_count() - 1)
 ):
     data_root_ = Path(argo_dir) / av2_type/ data_mode
     output_dir_ = Path(output_dir) / av2_type / data_mode
     output_dir_.mkdir(exist_ok=True, parents=True)
-    process_logs(data_root_, output_dir_, nproc, multi_frame)
+    process_logs(data_root_, output_dir_, nproc, multi_frame, neighbor_num)
     create_reading_index(output_dir_)
     if data_mode == "val" or data_mode == "test":
         create_eval_mask(data_mode, output_dir_, mask_dir)
