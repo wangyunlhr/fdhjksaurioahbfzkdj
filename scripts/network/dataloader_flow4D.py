@@ -1311,6 +1311,273 @@ class HDF5Dataset_onlybox(Dataset):
                     raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
 
         return res_dict
+# diff完成稀疏到稠密的生成
+def collate_fn_pad_new_NK(batch):
+
+    num_frames = 2
+    while f'pc_m{num_frames - 1}' in batch[0]:
+        num_frames += 1
+
+    # padding the data
+    pc0_all_after_mask_ground, pc1_all_after_mask_ground= [], []
+    pc0_one_after_mask_ground, pc1_one_after_mask_ground= [], []
+    pc0_a_to_c_list = []
+    pc1_a_to_c_list = []
+    time_list = []
+    scene_id_list = []
+
+    pc_m_after_mask_ground = [[] for _ in range(num_frames - 2)]
+    for i in range(len(batch)):
+        pc0_a_to_c = batch[i]['pc0_neighbor_a_to_c'].to(torch.long)
+        pc0_a_to_c_list.append(pc0_a_to_c)
+        pc1_a_to_c = batch[i]['pc1_neighbor_a_to_c'].to(torch.long)
+        pc1_a_to_c_list.append(pc1_a_to_c)
+
+        pc0_all_after_mask_ground.append(batch[i]['pc0_neighbor'])
+        pc1_all_after_mask_ground.append(batch[i]['pc1_neighbor'])
+        pc0_one_after_mask_ground.append(batch[i]['pc0'][pc0_a_to_c])
+        pc1_one_after_mask_ground.append(batch[i]['pc1'][pc1_a_to_c])
+        time_list.append(batch[i]['timestamp'])
+        scene_id_list.append(batch[i]['scene_id'])
+        for j in range(1, num_frames - 1):
+            pc_m_after_mask_ground[j-1].append(batch[i][f'pc_m{j}'][~batch[i][f'gm_m{j}']])
+    
+
+    pc0_all_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pc0_all_after_mask_ground, batch_first=True, padding_value=torch.nan)
+    pc1_all_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pc1_all_after_mask_ground, batch_first=True, padding_value=torch.nan)
+    pc0_one_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pc0_one_after_mask_ground, batch_first=True, padding_value=torch.nan)
+    pc1_one_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pc1_one_after_mask_ground, batch_first=True, padding_value=torch.nan)
+    pc_m_after_mask_ground = [torch.nn.utils.rnn.pad_sequence(pc_m, batch_first=True, padding_value=torch.nan) for pc_m in pc_m_after_mask_ground]
+
+
+    res_dict =  {
+        'pc0_all': pc0_all_after_mask_ground,
+        'pc1_all': pc1_all_after_mask_ground,
+        'pc0': pc0_one_after_mask_ground,
+        'pc1': pc1_one_after_mask_ground,
+        'pose0': [batch[i]['pose0'] for i in range(len(batch))],
+        'pose1': [batch[i]['pose1'] for i in range(len(batch))],
+        'timestamps': time_list,
+        'scene_ids': scene_id_list,
+    }
+
+    for j in range(1, num_frames - 1):
+        res_dict[f'pc_m{j}'] = pc_m_after_mask_ground[j-1]
+        res_dict[f'pose_m{j}'] = [batch[i][f'pose_m{j}'] for i in range(len(batch))]
+
+    if 'flow' in batch[0]:
+        flow = torch.nn.utils.rnn.pad_sequence([batch[i]['flow'][pc0_a_to_c[i]] for i in range(len(batch))], batch_first=True)
+        flow_is_valid = torch.nn.utils.rnn.pad_sequence([batch[i]['flow_is_valid'][pc0_a_to_c[i]] for i in range(len(batch))], batch_first=True) #! 不需要class mask，因为是目标帧的输出
+        flow_category_indices = torch.nn.utils.rnn.pad_sequence([batch[i]['flow_category_indices'][pc0_a_to_c[i]] for i in range(len(batch))], batch_first=True,  padding_value=255)
+        flow_category_labeled = torch.nn.utils.rnn.pad_sequence([batch[i]['flow_category_labeled'][pc0_a_to_c[i]] for i in range(len(batch))], batch_first=True)
+        
+        res_dict['flow'] = flow
+        res_dict['flow_is_valid'] = flow_is_valid
+        res_dict['flow_category_indices'] = flow_category_indices
+        res_dict['flow_category_labeled'] = flow_category_labeled
+
+        neighbor_flow = torch.nn.utils.rnn.pad_sequence([batch[i]['neighbor_flow']for i in range(len(batch))], batch_first=True)
+        neighbor_flow_is_valid = torch.nn.utils.rnn.pad_sequence([batch[i]['neighbor_flow_is_valid'] for i in range(len(batch))], batch_first=True) #! 不需要class mask，因为是目标帧的输出
+        neighbor_flow_category_indices = torch.nn.utils.rnn.pad_sequence([batch[i]['neighbor_flow_category_indices'] for i in range(len(batch))], batch_first=True,  padding_value=255)
+        neighbor_flow_category_labeled = torch.nn.utils.rnn.pad_sequence([batch[i]['neighbor_flow_category_labeled'] for i in range(len(batch))], batch_first=True)
+        
+        res_dict['neighbor_flow'] = neighbor_flow
+        res_dict['neighbor_flow_is_valid'] = neighbor_flow_is_valid
+        res_dict['neighbor_flow_category_indices'] = neighbor_flow_category_indices
+        res_dict['neighbor_flow_category_labeled'] = neighbor_flow_category_labeled
+
+    if 'ego_motion' in batch[0]:
+        res_dict['ego_motion'] = [batch[i]['ego_motion'] for i in range(len(batch))]
+
+    return res_dict
+
+
+
+#! multi_frame_idx 多帧加载监督N,K,3个点，配合collate_new_NK
+class HDF5Dataset_new_NK(Dataset):
+    def __init__(self, directory, n_frames, eval = False):
+        '''
+        directory: the directory of the dataset
+        eval: if True, use the eval index
+        '''
+        super(HDF5Dataset_new_NK, self).__init__()
+        self.directory = directory
+        self.mode = os.path.basename(self.directory)
+        
+        with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
+            self.data_index = pickle.load(f)
+        if self.mode == 'train':
+            self.data_index = self.data_index[:10] #! debug
+        # self.data_index = sorted(self.data_index) # sorted for debug
+        # self.data_index = sorted(self.data_index) # sorted for debug
+
+        with open('/data0/code/Flow4D_diff_less_to_more/conf/labeling.yaml', 'r') as file:
+            labeling_map = yaml.safe_load(file)
+
+        self.learning_map = labeling_map['Argoverse_learning_map']
+
+        self.n_frames = n_frames
+        assert self.n_frames >= 2, "n_frames must be 2 or more."
+        
+        print('dataloader mode = {} num_frames = {}'.format(self.mode, self.n_frames))
+
+        self.eval_index = False
+        if eval:
+            if not os.path.exists(os.path.join(self.directory, 'index_eval.pkl')):
+                raise Exception(f"No eval index file found! Please check {self.directory}")
+            self.eval_index = eval
+
+            if self.mode == 'val':
+                with open(os.path.join(self.directory, 'index_eval.pkl'), 'rb') as f:
+                    self.eval_data_index = pickle.load(f)
+            elif self.mode == 'test':
+                with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f: #jy
+                    self.eval_data_index = pickle.load(f)
+            else:
+                raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        self.scene_id_bounds = {}  # 存储每个scene_id的最大最小timestamp和位置
+        for idx, (scene_id, timestamp) in enumerate(self.data_index):
+            if scene_id not in self.scene_id_bounds:
+                self.scene_id_bounds[scene_id] = {
+                    "min_timestamp": timestamp,
+                    "max_timestamp": timestamp,
+                    "min_index": idx,
+                    "max_index": idx
+                }
+            else:
+                bounds = self.scene_id_bounds[scene_id]
+                # 更新最小timestamp和位置
+                if timestamp < bounds["min_timestamp"]:
+                    bounds["min_timestamp"] = timestamp
+                    bounds["min_index"] = idx
+                # 更新最大timestamp和位置
+                if timestamp > bounds["max_timestamp"]:
+                    bounds["max_timestamp"] = timestamp
+                    bounds["max_index"] = idx
+
+    def __len__(self):
+        if self.eval_index:
+            return len(self.eval_data_index)
+        return len(self.data_index)
+    
+    def __getitem__(self, index_):
+        if self.eval_index:
+            scene_id, timestamp = self.eval_data_index[index_]
+            # find this one index in the total index
+            index_ = self.data_index.index([scene_id, timestamp]) 
+        else:
+            scene_id, timestamp = self.data_index[index_] 
+            # to make sure we have continuous frames
+            if (self.scene_id_bounds[scene_id]["max_index"] - 1) <= index_: #! 因为最后一阵没有target_mask
+                index_ = index_ - 2
+            scene_id, timestamp = self.data_index[index_] 
+
+        key = str(timestamp)
+        with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f: 
+
+            pc0 = torch.tensor(f[key]['target_point'][:]) 
+            gm0 = torch.tensor(f[key]['target_ground_mask'][:]) 
+            pose0 = torch.tensor(f[key]['pose'][:]) 
+
+            pc0_neighbor = torch.tensor(f[key]['neighbor_point'][:])
+            pc0_neighbor_a_to_c = torch.tensor(f[key]['neighbor_a_to_c'][:])
+
+            if self.scene_id_bounds[scene_id]["max_index"] == index_: 
+                return self.__getitem__(index_ + 1)
+            else:
+                next_timestamp = str(self.data_index[index_+1][1])
+
+            pc1 = torch.tensor(f[next_timestamp]['target_point'][:]) 
+            gm1 = torch.tensor(f[next_timestamp]['target_ground_mask'][:]) 
+            pose1 = torch.tensor(f[next_timestamp]['pose'][:]) 
+
+            pc1_neighbor = torch.tensor(f[next_timestamp]['neighbor_point'][:])
+            pc1_neighbor_a_to_c = torch.tensor(f[next_timestamp]['neighbor_a_to_c'][:])
+
+
+            res_dict = {
+                'scene_id': scene_id,
+                'timestamp': key,
+
+                "pc0": pc0,
+                "gm0": gm0,
+                "pose0": pose0,
+
+                "pc0_neighbor": pc0_neighbor,
+                "pc0_neighbor_a_to_c": pc0_neighbor_a_to_c,
+
+                "pc1": pc1,
+                "gm1": gm1,
+                "pose1": pose1,
+
+                "pc1_neighbor": pc1_neighbor,
+                "pc1_neighbor_a_to_c": pc1_neighbor_a_to_c
+            }
+
+
+            if self.n_frames > 2: 
+                past_frames = []
+                num_past_frames = self.n_frames - 2  
+
+                for i in range(1, num_past_frames + 1):
+                    frame_index = index_ - i
+                    if frame_index < self.scene_id_bounds[scene_id]["min_index"]: 
+                        frame_index = self.scene_id_bounds[scene_id]["min_index"] 
+
+                    past_timestamp = str(self.data_index[frame_index][1])
+                    past_pc = torch.tensor(f[past_timestamp]['lidar'][:])
+                    past_gm = torch.tensor(f[past_timestamp]['ground_mask'][:])
+                    past_pose = torch.tensor(f[past_timestamp]['pose'][:])
+
+                    past_frames.append((past_pc, past_gm, past_pose))
+
+                for i, (past_pc, past_gm, past_pose) in enumerate(past_frames):
+                    res_dict[f'pc_m{i+1}'] = past_pc
+                    res_dict[f'gm_m{i+1}'] = past_gm
+                    res_dict[f'pose_m{i+1}'] = past_pose
+
+
+            if 'target_flow' in f[key]:
+                target_flow = torch.tensor(f[key]['target_flow'][:])
+                target_flow_valid = torch.tensor(f[key]['target_flow_valid'][:]) 
+                target_flow_category = torch.tensor(f[key]['target_flow_category'][:]) 
+
+                neighbor_flow = torch.tensor(f[key]['neighbor_flow'][:])
+                neighbor_flow_vaild = torch.tensor(f[key]['neighbor_flow_vaild'][:]) 
+                neighbor_flow_category = torch.tensor(f[key]['neighbor_flow_category'][:]) 
+
+                res_dict['flow'] = target_flow
+                res_dict['flow_is_valid'] = target_flow_valid
+                res_dict['flow_category_indices'] = target_flow_category
+                res_dict['neighbor_flow'] = neighbor_flow
+                res_dict['neighbor_flow_is_valid'] = neighbor_flow_vaild
+                res_dict['neighbor_flow_category_indices'] = neighbor_flow_category
+
+                flow_category_labeled = map_label(f[key]['target_flow_category'][:], self.learning_map) 
+                flow_category_labeled_tensor = torch.tensor(flow_category_labeled, dtype=torch.int32)
+                res_dict['flow_category_labeled'] = flow_category_labeled_tensor 
+
+                neighbor_flow_category_labeled = map_label(f[key]['neighbor_flow_category'][:], self.learning_map) 
+                neighbor_flow_category_labeled_tensor = torch.tensor(neighbor_flow_category_labeled, dtype=torch.int32)
+                res_dict['neighbor_flow_category_labeled'] = neighbor_flow_category_labeled_tensor 
+
+            if 'ego_motion' in f[key]:
+                ego_motion = torch.tensor(f[key]['ego_motion'][:])
+                res_dict['ego_motion'] = ego_motion
+
+
+            if self.eval_index: 
+                if self.mode == 'val':
+                    eval_mask = torch.tensor(f[key]['eval_mask'][:])
+                    res_dict['eval_mask'] = eval_mask 
+                elif self.mode == 'test':
+                    eval_mask = torch.ones(pc0.shape[0], 1, dtype=torch.bool) 
+                    res_dict['eval_mask'] = eval_mask
+                else:
+                    raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        return res_dict
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DataLoader test")
