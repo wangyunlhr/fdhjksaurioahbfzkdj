@@ -461,9 +461,9 @@ def sparse_to_dense(data_dict, neighbor_num, flow_flag):
         flow_is_valid = torch.tensor(data_dict['valid_flow_0'][:], dtype=torch.bool)
         flow_final_mask = flow_is_valid & flow_another_mask #有效的flow mask
         point_idxes_all = point_idxes_all.cpu()
-        flow_masks_all = flow_final_mask[point_idxes_all]
-        flow_value_all = data_dict['flow_0_1'][point_idxes_all]
-        flow_category_all = data_dict['classes_0'][point_idxes_all]
+        flow_masks_all = flow_final_mask[pc0_valid_mask][point_idxes_all]
+        flow_value_all = data_dict['flow_0_1'][pc0_valid_mask][point_idxes_all]
+        flow_category_all = data_dict['classes_0'][pc0_valid_mask][point_idxes_all]
         neighbor_idx = neighbor_idx.cpu()
         neighbor_flow_valid = flow_masks_all[neighbor_idx]
         neighbor_flow = flow_value_all[neighbor_idx]
