@@ -92,3 +92,66 @@ def ff3dLoss(res_dict):
     background_scalar = is_foreground_class.float() * 0.9 + 0.1
     error = error * background_scalar
     return error.mean()
+
+
+# add feature loss
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+class VGGPerceptionLoss3D(nn.Module):
+    def __init__(self, in_channels=16, target_channels=3, feature_layer="conv4_2", loss_type="l1"):
+        """
+        计算五维张量 (B, C, H, W, Z) 的 VGG 感知损失
+        :param in_channels: 原始特征通道数（如 16）
+        :param target_channels: VGG 需要的输入通道数（默认 3）
+        :param feature_layer: 选择 VGG 的特征提取层
+        :param loss_type: "l1" 或 "l2"
+        """
+        super(VGGPerceptionLoss3D, self).__init__()
+        
+        # 1×1 卷积将 C 维度降到 3
+        self.channel_mapper = nn.Conv2d(in_channels, target_channels, kernel_size=1)
+
+        # 载入 VGG 并选择特征提取层
+        vgg = models.vgg16(pretrained=True).features
+        if feature_layer == "conv4_2":
+            self.feature_extractor = nn.Sequential(*vgg[:23])  # 取 VGG16 的 `conv4_2`
+        elif feature_layer == "conv5_2":
+            self.feature_extractor = nn.Sequential(*vgg[:30])  # 取 VGG16 的 `conv5_2`
+        else:
+            raise ValueError("feature_layer must be 'conv4_2' or 'conv5_2'")
+
+        self.feature_extractor.eval()
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False  # 冻结 VGG 参数
+
+        # 选择损失函数
+        self.loss_fn = nn.L1Loss() if loss_type == "l1" else nn.MSELoss()
+
+    def forward(self, pred, gt):
+        B, C, H, W, Z = pred.shape  # 解析 5D 形状
+        loss = 0
+
+        for z in range(Z):  # 遍历 Z 维度的每一层
+            pred_slice = pred[:, :, :, :, z]  # 取 z 轴上的 2D 切片 (B, C, H, W)
+            gt_slice = gt[:, :, :, :, z]
+
+            # 使用 1×1 卷积降维到 3 通道
+            pred_slice = self.channel_mapper(pred_slice)
+            gt_slice = self.channel_mapper(gt_slice)
+
+            # 计算 VGG 感知损失
+            loss += self.loss_fn(self.feature_extractor(pred_slice), self.feature_extractor(gt_slice))
+
+        return loss / Z  # 取平均，确保所有 Z 层贡献均衡
+
+# 示例
+B, C, H, W, Z = 4, 16, 224, 224, 10  # 五维体数据
+pred = torch.randn(B, C, H, W, Z)
+gt = torch.randn(B, C, H, W, Z)
+
+# 计算 VGG 3D 感知损失
+loss_fn = VGGPerceptionLoss3D(in_channels=16)
+loss = loss_fn(pred, gt)
+print("VGG 3D Perception Loss:", loss.item())
