@@ -1579,6 +1579,233 @@ class HDF5Dataset_new_NK(Dataset):
 
         return res_dict
 
+def split_frame(frame_list, num):
+    ts_list = []
+    for frame in frame_list:
+        ts_list.append(frame['timestamp'].decode('utf-8'))
+
+    current_len = len(ts_list)
+    if current_len < num:
+        needed = num - current_len
+        ts_list += [ts_list[i % current_len] for i in range(needed)]
+
+    return ts_list[:num]
+
+def cal_pose_inv(pose1: np.ndarray):
+    pose1_inv = np.eye(4, dtype=np.float64)
+    R = pose1[:3, :3]
+    t = pose1[:3, 3]
+    pose1_inv[:3, :3] = R.T  # 旋转部分取转置
+    pose1_inv[:3, 3] = -R.T @ t  # 正确的矩阵乘法计算平移逆
+
+    return pose1_inv
+
+
+def save_lidar(pt_np, path, color = [0, 1.0, 0]):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pt_np)  # 100个随机点
+    pcd.paint_uniform_color(color)  # 设置颜色（绿色）
+    o3d.io.write_point_cloud(path, pcd)
+
+
+class HDF5Dataset_selectbox(Dataset):
+    def __init__(self, directory, n_frames, eval = False):
+        '''
+        directory: the directory of the dataset
+        eval: if True, use the eval index
+        '''
+        super(HDF5Dataset_selectbox, self).__init__()
+        self.directory = directory
+        self.mode = os.path.basename(self.directory)
+        
+        with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
+            self.data_index = pickle.load(f)
+
+        with open('./conf/labeling.yaml', 'r') as file:
+            labeling_map = yaml.safe_load(file)
+
+        self.learning_map = labeling_map['Argoverse_learning_map']
+
+        self.n_frames = n_frames
+        assert self.n_frames >= 2, "n_frames must be 2 or more."
+        
+        print('dataloader mode = {} num_frames = {}'.format(self.mode, self.n_frames))
+
+        self.eval_index = False
+        # ! eval_all image
+        if eval:
+            if not os.path.exists(os.path.join(self.directory, 'index_eval.pkl')):
+                raise Exception(f"No eval index file found! Please check {self.directory}")
+            self.eval_index = eval
+
+            if self.mode == 'val':
+                with open(os.path.join(self.directory, 'index_eval.pkl'), 'rb') as f:
+                    self.eval_data_index = pickle.load(f)
+            elif self.mode == 'test':
+                with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f: #jy
+                    self.eval_data_index = pickle.load(f)
+            else:
+                raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        self.scene_id_bounds = {}  # 存储每个scene_id的最大最小timestamp和位置
+        for idx, (scene_id, timestamp) in enumerate(self.data_index):
+            if scene_id not in self.scene_id_bounds:
+                self.scene_id_bounds[scene_id] = {
+                    "min_timestamp": timestamp,
+                    "max_timestamp": timestamp,
+                    "min_index": idx,
+                    "max_index": idx
+                }
+            else:
+                bounds = self.scene_id_bounds[scene_id]
+                # 更新最小timestamp和位置
+                if timestamp < bounds["min_timestamp"]:
+                    bounds["min_timestamp"] = timestamp
+                    bounds["min_index"] = idx
+                # 更新最大timestamp和位置
+                if timestamp > bounds["max_timestamp"]:
+                    bounds["max_timestamp"] = timestamp
+                    bounds["max_index"] = idx
+
+    def __len__(self):
+        if self.eval_index:
+            return len(self.eval_data_index)
+        return len(self.data_index)
+    
+    def __getitem__(self, index_):
+        #! eval all
+        if self.eval_index:
+            scene_id, timestamp = self.eval_data_index[index_]
+            # find this one index in the total index
+            index_ = self.data_index.index([scene_id, timestamp]) 
+        else:
+            scene_id, timestamp = self.data_index[index_] 
+            # to make sure we have continuous frames
+            if self.scene_id_bounds[scene_id]["max_index"] == index_: 
+                index_ = index_ - 1
+        scene_id, timestamp = self.data_index[index_] 
+
+        key = str(timestamp)
+        # with h5py.File(os.path.join('/data1/dataset/av2/box_visual/sensor/val/', f'{scene_id}.h5'), 'r') as f: 
+        #     pc0_box = torch.tensor(f[key]['lidar'][:]) 
+        #     gm0_box = torch.tensor(f[key]['ground_mask'][:]) 
+        #     pose0_box = torch.tensor(f[key]['pose'][:]) 
+
+        with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f: 
+            pc0 = torch.tensor(f[key]['lidar'][:]) 
+            gm0 = torch.tensor(f[key]['ground_mask'][:]) 
+            pose0 = torch.tensor(f[key]['pose'][:]) 
+            #! add_select_box
+            box_ids_dset0 = f[key]['box_ids']
+            box_ids0 = [x.decode('utf-8') for x in box_ids_dset0[:]] #0时刻下的box_id
+            box_poses0 = f[key]['box_poses']
+            acc_points0 = []
+            for i, box_id in enumerate(box_ids0): #对每一个box进行筛选
+                box_group = f[box_id]
+                select_best = box_group['sorted_frame_list']
+                select_best_sorted = split_frame(select_best, 8)
+                select_point_list = []
+                for best_frame in select_best_sorted: #对每一个最佳帧进行筛选
+                    point = box_group[best_frame]['point']
+                    pose = box_group[best_frame]['pose']
+                    pose_inv = cal_pose_inv(pose)
+                    transformed_point = point @ pose_inv[:3, :3].T + pose_inv[:3, 3]
+                    select_point_list.append(transformed_point)
+                select_point_np = np.concatenate(select_point_list, axis=0)
+                box_pose0 = box_poses0[i]
+                select_point_transformed = select_point_np @ box_pose0[:3, :3].T + box_pose0[:3, 3]
+                acc_points0.append(select_point_transformed)
+            acc_points0_all = np.concatenate(acc_points0, axis=0)
+            os.makedirs(f"./{scene_id}", exist_ok=True)
+            save_lidar(acc_points0_all, f"./{scene_id}/{key}_acc_points0.ply")
+            save_lidar(pc0, f"./{scene_id}/{key}_pc0.ply")
+            all_points = np.concatenate([pc0, acc_points0_all], axis=0)
+            save_lidar(all_points, f"./{scene_id}/{key}_all_points.ply")
+            # assert torch.equal(pc0_box, pc0)
+            # assert torch.equal(gm0_box, gm0)
+            # assert torch.equal(pose0_box, pose0)
+
+            if self.scene_id_bounds[scene_id]["max_index"] == index_:
+                print("!!!!!!__getitem__(index_ + 1)") 
+                return self.__getitem__(index_ + 1)
+            else:
+                next_timestamp = str(self.data_index[index_+1][1])
+
+            pc1 = torch.tensor(f[next_timestamp]['lidar'][:])
+            gm1 = torch.tensor(f[next_timestamp]['ground_mask'][:]) 
+            pose1 = torch.tensor(f[next_timestamp]['pose'][:])
+
+
+            res_dict = {
+                'scene_id': scene_id,
+                'timestamp': key,
+                'pc0': pc0, #current
+                'gm0': gm0, #current
+                'pose0': pose0, #current
+                'pc1': pc1, #nect
+                'gm1': gm1, #next
+                'pose1': pose1, #next
+            }
+
+
+            if self.n_frames > 2: 
+                past_frames = []
+                num_past_frames = self.n_frames - 2  
+
+                for i in range(1, num_past_frames + 1):
+                    frame_index = index_ - i
+                    if frame_index < self.scene_id_bounds[scene_id]["min_index"]: 
+                        frame_index = self.scene_id_bounds[scene_id]["min_index"] 
+
+                    past_timestamp = str(self.data_index[frame_index][1])
+                    past_pc = torch.tensor(f[past_timestamp]['lidar'][:])
+                    past_gm = torch.tensor(f[past_timestamp]['ground_mask'][:])
+                    past_pose = torch.tensor(f[past_timestamp]['pose'][:])
+
+                    past_frames.append((past_pc, past_gm, past_pose))
+
+                for i, (past_pc, past_gm, past_pose) in enumerate(past_frames):
+                    res_dict[f'pc_m{i+1}'] = past_pc
+                    res_dict[f'gm_m{i+1}'] = past_gm
+                    res_dict[f'pose_m{i+1}'] = past_pose
+
+            if 'flow' in f[key]:
+                flow = torch.tensor(f[key]['flow'][:])
+                flow_is_valid = torch.tensor(f[key]['flow_is_valid'][:]) 
+                flow_category_indices = torch.tensor(f[key]['flow_category_indices'][:]) 
+                res_dict['flow'] = flow
+                res_dict['flow_is_valid'] = flow_is_valid
+                res_dict['flow_category_indices'] = flow_category_indices #原始的category属性
+                mask = (flow_category_indices == 0) & (~gm0)
+                no_box_background = pc0[mask]
+                save_lidar(all_points, f"./{scene_id}/{key}_no_box_background.ply")
+                flow_category_labeled = map_label(f[key]['flow_category_indices'][:], self.learning_map) 
+                flow_category_labeled_tensor = torch.tensor(flow_category_labeled, dtype=torch.int32)
+                res_dict['flow_category_labeled'] = flow_category_labeled_tensor #映射之后的label
+
+            if 'ego_motion' in f[key]:
+                ego_motion = torch.tensor(f[key]['ego_motion'][:])
+                res_dict['ego_motion'] = ego_motion
+
+            #! eval all
+            # res_dict['eval_mask'] = (~(gm0 | (torch.tensor(f[key]['flow_category_indices'][:]) == 0)))
+            if self.eval_index: 
+                if self.mode == 'val':
+                    eval_mask = torch.tensor(f[key]['eval_mask'][:])
+                    res_dict['eval_mask'] = eval_mask 
+                elif self.mode == 'test':
+                    eval_mask = torch.ones(pc0.shape[0], 1, dtype=torch.bool) 
+                    res_dict['eval_mask'] = eval_mask
+                else:
+                    raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        return res_dict
+
+
+
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DataLoader test")
     parser.add_argument('--data_mode', '-m', type=str, default='val', metavar='N', help='Dataset mode.')
