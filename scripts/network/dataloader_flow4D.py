@@ -1802,7 +1802,44 @@ class HDF5Dataset_selectbox(Dataset):
         return res_dict
 
 
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 
+def add_se3_noise(T_gt, trans_std=0.1, angle_std=10.0):
+    """
+    为4×4变换矩阵添加平移和旋转噪声
+    
+    参数:
+        T_gt: 原始4×4变换矩阵 (numpy数组)
+        trans_std: 平移噪声标准差 (单位：米)
+        angle_std: 旋转噪声标准差 (单位：度)
+    
+    返回:
+        T_noisy: 加噪后的4×4矩阵
+    """
+    # 分解矩阵为旋转和平移
+    R_gt = T_gt[:3, :3]
+    t_gt = T_gt[:3, 3]
+    
+    # --- 平移噪声 ---
+    delta_t = np.random.normal(0, trans_std, 3)
+    t_noisy = t_gt + delta_t
+    
+    # --- 旋转噪声 ---
+    # 生成随机轴-角扰动 (角度符合高斯分布)
+    axis = np.random.randn(3)          # 随机轴（归一化前）
+    axis /= np.linalg.norm(axis)       # 单位化
+    angle_rad = np.deg2rad(np.random.normal(0, angle_std))  # 角度转弧度
+    
+    # 生成扰动旋转矩阵
+    delta_R = R.from_rotvec(axis * angle_rad).as_matrix()
+    R_noisy = R_gt @ delta_R  # 矩阵乘法（右乘扰动）
+    
+    # 重建噪声矩阵
+    T_noisy = np.eye(4)
+    T_noisy[:3, :3] = R_noisy
+    T_noisy[:3, 3] = t_noisy
+    return T_noisy
 
 
 
