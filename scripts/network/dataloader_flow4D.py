@@ -22,6 +22,371 @@ import numpy as np
 # lock = multiprocessing.Lock()
 
 
+
+def collate_fn_pad_track(batch):
+
+    # num_frames = 2
+    # while f'pc_m{num_frames - 1}' in batch[0]:
+    #     num_frames += 1
+
+    # padding the data
+    pc0_ori, pc1_ori= [], []
+    pc0_gm0, pc1_gm1= [], []
+
+    # pc_m_after_mask_ground = [[] for _ in range(num_frames - 2)]
+    for i in range(len(batch)):
+        pc0_ori.append(batch[i]['pc0'])
+        pc1_ori.append(batch[i]['pc1'])
+        pc0_gm0.append(batch[i]['gm0'])
+        pc1_gm1.append(batch[i]['gm1'])
+        # for j in range(1, num_frames - 1):
+            # pc_m_after_mask_ground[j-1].append(batch[i][f'pc_m{j}'][~batch[i][f'gm_m{j}']])
+    
+
+    pc0_ori = torch.nn.utils.rnn.pad_sequence(pc0_ori, batch_first=True, padding_value=torch.nan)
+    pc1_ori = torch.nn.utils.rnn.pad_sequence(pc1_ori, batch_first=True, padding_value=torch.nan)
+    pc0_gm0 = torch.nn.utils.rnn.pad_sequence(pc0_gm0, batch_first=True, padding_value=torch.nan)
+    pc1_gm1 = torch.nn.utils.rnn.pad_sequence(pc1_gm1, batch_first=True, padding_value=torch.nan)
+    # pc_m_after_mask_ground = [torch.nn.utils.rnn.pad_sequence(pc_m, batch_first=True, padding_value=torch.nan) for pc_m in pc_m_after_mask_ground]
+
+
+    res_dict =  {
+        'pc0': pc0_ori,
+        'pc1': pc1_ori,
+        'gm0': pc0_gm0,
+        'gm1': pc1_gm1,
+        'pose0': [batch[i]['pose0'] for i in range(len(batch))],
+        'pose1': [batch[i]['pose1'] for i in range(len(batch))],
+    }
+
+    # for j in range(1, num_frames - 1):
+    #     res_dict[f'pc_m{j}'] = pc_m_after_mask_ground[j-1]
+    #     res_dict[f'pose_m{j}'] = [batch[i][f'pose_m{j}'] for i in range(len(batch))]
+
+    if 'flow' in batch[0]: #NOTE 全部都没有去除地面点
+        flow = torch.nn.utils.rnn.pad_sequence([batch[i]['flow'] for i in range(len(batch))], batch_first=True)
+        flow_is_valid = torch.nn.utils.rnn.pad_sequence([batch[i]['flow_is_valid'] for i in range(len(batch))], batch_first=True)
+        flow_category_indices = torch.nn.utils.rnn.pad_sequence([batch[i]['flow_category_indices'] for i in range(len(batch))], batch_first=True)
+        flow_category_labeled = torch.nn.utils.rnn.pad_sequence([batch[i]['flow_category_labeled'] for i in range(len(batch))], batch_first=True)
+        
+        res_dict['flow'] = flow
+        res_dict['flow_is_valid'] = flow_is_valid
+        res_dict['flow_category_indices'] = flow_category_indices
+        res_dict['flow_category_labeled'] = flow_category_labeled
+
+    if 'ego_motion' in batch[0]:
+        res_dict['ego_motion'] = [batch[i]['ego_motion'] for i in range(len(batch))]
+
+    #NOTE 新增box序列处理
+
+    box_data = {
+        'batch_indices': [],        # 记录每个box所属的batch索引
+        'original_box_idx': [],     # 记录每个box在原始点云中的索引
+        'box_pc0': [],             # 当前帧box点云（归一化坐标系）
+        'box_p0_dense': [],        # 时序点云序列
+        'box_pc1': []              # 下一帧box点云（归一化坐标系）
+    }
+
+    # 遍历batch收集box数据
+    for batch_idx, sample in enumerate(batch):
+        if 'frame_boxes' in sample:
+            for box in sample['frame_boxes']:
+                box_data['batch_indices'].append(batch_idx)
+                box_data['original_box_idx'].append(box['box_idx'])
+                
+                # 转换到float32并添加序列维度
+                box_data['box_pc0'].append(box['box_pc0'].to(torch.float32)) 
+                box_data['box_p0_dense'].append(box['box_p0_dense'].to(torch.float32))
+                box_data['box_pc1'].append(box['box_pc1'].to(torch.float32))
+
+    # 动态目标数据填充
+    if box_data['box_pc0']:
+        # 点云维度填充 (B*N_boxes, T, 3)
+        box_data['box_pc0'] = torch.nn.utils.rnn.pad_sequence(
+            [x for x in box_data['box_pc0']], 
+            batch_first=True, 
+            padding_value=torch.nan
+        )
+        
+        # 时序点云填充 (B*N_boxes, num_frames, 3)
+        box_data['box_p0_dense'] = torch.nn.utils.rnn.pad_sequence(
+            [x for x in box_data['box_p0_dense']], 
+            batch_first=True, 
+            padding_value=torch.nan
+        )
+        
+        box_data['box_pc1'] = torch.nn.utils.rnn.pad_sequence(
+            [x for x in box_data['box_pc1']], 
+            batch_first=True, 
+            padding_value=torch.nan
+        )
+        
+
+    return res_dict
+
+
+
+
+
+#! for track_id
+class HDF5Dataset_track_data(Dataset):
+    def __init__(self, directory, n_frames, eval = False):
+        '''
+        directory: the directory of the dataset
+        eval: if True, use the eval index
+        '''
+        super(HDF5Dataset_track_data, self).__init__()
+        self.directory = directory
+        self.mode = os.path.basename(self.directory)
+        
+        with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
+            self.data_index = pickle.load(f)
+
+        with open('./conf/labeling.yaml', 'r') as file:
+            labeling_map = yaml.safe_load(file)
+
+        self.learning_map = labeling_map['Argoverse_learning_map']
+
+        self.n_frames = n_frames
+        assert self.n_frames >= 2, "n_frames must be 2 or more."
+        
+        print('dataloader mode = {} num_frames = {}'.format(self.mode, self.n_frames))
+
+        self.eval_index = False
+        # ! eval_all image
+        if eval:
+            if not os.path.exists(os.path.join(self.directory, 'index_eval.pkl')):
+                raise Exception(f"No eval index file found! Please check {self.directory}")
+            self.eval_index = eval
+
+            if self.mode == 'val':
+                with open(os.path.join(self.directory, 'index_eval.pkl'), 'rb') as f:
+                    self.eval_data_index = pickle.load(f)
+            elif self.mode == 'test':
+                with open(os.path.join('/data0/code/Flow4D_ori/assets/docs/index_eval_v2.pkl'), 'rb') as f: #jy
+                    self.eval_data_index = pickle.load(f)
+            else:
+                raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+
+        self.scene_id_bounds = {}  # 存储每个scene_id的最大最小timestamp和位置
+        for idx, (scene_id, timestamp) in enumerate(self.data_index):
+            if scene_id not in self.scene_id_bounds:
+                self.scene_id_bounds[scene_id] = {
+                    "min_timestamp": timestamp,
+                    "max_timestamp": timestamp,
+                    "min_index": idx,
+                    "max_index": idx
+                }
+            else:
+                bounds = self.scene_id_bounds[scene_id]
+                # 更新最小timestamp和位置
+                if timestamp < bounds["min_timestamp"]:
+                    bounds["min_timestamp"] = timestamp
+                    bounds["min_index"] = idx
+                # 更新最大timestamp和位置
+                if timestamp > bounds["max_timestamp"]:
+                    bounds["max_timestamp"] = timestamp
+                    bounds["max_index"] = idx
+
+    def __len__(self):
+        if self.eval_index:
+            return len(self.eval_data_index)
+        return len(self.data_index)
+    
+    def __getitem__(self, index_):
+        #! eval all
+        if self.eval_index:
+            scene_id, timestamp = self.eval_data_index[index_]
+            # find this one index in the total index
+            index_ = self.data_index.index([scene_id, timestamp]) 
+        else:
+            scene_id, timestamp = self.data_index[index_] 
+            # to make sure we have continuous frames
+            if self.scene_id_bounds[scene_id]["max_index"] == index_: 
+                index_ = index_ - 1
+        scene_id, timestamp = self.data_index[index_] 
+
+        key = str(timestamp)
+        # with h5py.File(os.path.join('/data1/dataset/av2/box_visual/sensor/val/', f'{scene_id}.h5'), 'r') as f: 
+        #     pc0_box = torch.tensor(f[key]['lidar'][:]) 
+        #     gm0_box = torch.tensor(f[key]['ground_mask'][:]) 
+        #     pose0_box = torch.tensor(f[key]['pose'][:]) 
+
+        with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f: 
+            #! 1.获取全部的box_id
+            box_ids0 = f[key]['box_ids'][:]
+            box_poses0 = f[key]['box_poses'][:]
+            box_category0 = f[key]['box_category'][:]
+            box_mask0 = f[key]['box_mask'][:]
+
+            pc0 = torch.tensor(f[key]['lidar'][:]) 
+            gm0 = torch.tensor(f[key]['ground_mask'][:]) 
+            pose0 = torch.tensor(f[key]['pose'][:]) 
+            # assert torch.equal(pc0_box, pc0)
+            # assert torch.equal(gm0_box, gm0)
+            # assert torch.equal(pose0_box, pose0)
+
+            if self.scene_id_bounds[scene_id]["max_index"] == index_:
+                print("!!!!!!__getitem__(index_ + 1)") 
+                return self.__getitem__(index_ + 1)
+            else:
+                next_timestamp = str(self.data_index[index_+1][1])
+
+            pc1 = torch.tensor(f[next_timestamp]['lidar'][:])
+            gm1 = torch.tensor(f[next_timestamp]['ground_mask'][:]) 
+            pose1 = torch.tensor(f[next_timestamp]['pose'][:])
+            pose1_to_0 = cal_pose0to1(pose1, pose0) #! 这里是ego_pose
+            pose0_to_1 = cal_pose0to1(pose0, pose1)
+
+            res_dict = {
+                'scene_id': scene_id,
+                'timestamp': key,
+                'pc0': pc0, #current
+                'gm0': gm0, #current
+                'pose0': pose0, #current
+                'pc1': pc1, #nect
+                'gm1': gm1, #next
+                'pose1': pose1, #next
+            }
+
+
+            if self.n_frames > 2: 
+                past_frames = []
+                num_past_frames = self.n_frames - 2  
+                frame_boxes = []
+                for i, box_id in enumerate(box_ids0): #对每一个box进行筛选
+                    #! 1先判断下一帧有没有同款
+                    if box_id not in f[next_timestamp]['box_ids'][:]:
+                        continue
+                    past_frames_for_box0 = []
+                    past_frames_for_box1 = []
+                    #! 存储全局中box的映射关系
+                    box_idx = np.where(box_mask0 == box_id)[0]
+                    box_pc0 = pc0[box_idx]
+
+                    box_group = f[str(box_id)]
+                    #! 获取当前帧box的pose
+                    box_pose0 = torch.tensor(box_group[key]['pose'][:])
+                    box_pose1 = torch.tensor(box_group[next_timestamp]['pose'][:])
+                    box_pose0_inv = cal_pose_inv(box_pose0)
+                    transformed_box_pc0 = box_pc0 @ box_pose0_inv[:3, :3].T + box_pose0_inv[:3, 3] #将box点从当前帧坐标系转换到box0坐标系下
+                    select_best = box_group['sorted_frame_list']
+                    select_best_sorted = split_frame(select_best, num_past_frames)
+
+                    #NOTE 用于debug flow
+                    flow = torch.tensor(f[key]['flow'][:])
+                    flow_box = flow[box_idx]
+                    ego_flow_box = box_pc0 @ pose0_to_1[:3, :3].T + pose0_to_1[:3, 3] - box_pc0 
+                    flow_gt_box = ((box_pc0 + flow_box) @ pose1_to_0[:3, :3].T + pose1_to_0[:3, 3]) @ box_pose0_inv[:3, :3].T + box_pose0_inv[:3, 3] - transformed_box_pc0 #! 这里是flow_gt
+                    #! box_flow转换成原始已经补偿了ego_motion的flow
+                    flow_restore = ((transformed_box_pc0.to(torch.float32) + flow_gt_box.to(torch.float32)) @ box_pose0[:3, :3].T + box_pose0[:3, 3]) @ pose0_to_1[:3, :3].T + pose0_to_1[:3, 3] - (box_pc0@ pose0_to_1[:3, :3].T + pose0_to_1[:3, 3])
+
+                    #! 下一时刻的同一个box_id的点————>转换到0帧坐标系下
+                    box_pc1 = torch.tensor(box_group[next_timestamp]['point'][:])
+                    box_pc1_frame0 = (box_pc1 @ pose1_to_0[:3, :3].T + pose1_to_0[:3, 3]).to(torch.float32)
+                    box_pc1_frame0_inbox0 = (box_pc1_frame0 @ box_pose0_inv[:3, :3].T + box_pose0_inv[:3, 3]).to(torch.float32)
+                    # select_best_sorted += [key, next_timestamp]
+
+                    for j, best_frame in enumerate(select_best_sorted): #对每一个最佳帧进行筛选
+                        point = box_group[best_frame]['point']
+                        pose = box_group[best_frame]['pose']
+                        pose_inv = cal_pose_inv(pose)
+                        transformed_point = point @ pose_inv[:3, :3].T + pose_inv[:3, 3]
+                        past_pc = torch.tensor(transformed_point, dtype=torch.float32)
+                        past_for_one = ((past_pc @ box_pose1[:3, :3].T + box_pose1[:3, 3]) @ pose1_to_0[:3, :3].T + pose1_to_0[:3, 3]) @ box_pose0_inv[:3, :3].T + box_pose0_inv[:3, 3]
+                        
+                        # if True:
+                        #     pose_noise = add_se3_noise(np.eye(4))
+                        #     transformed_point = transformed_point @ pose_noise[:3, :3].T + pose_noise[:3, 3]
+                        # if box_group[best_frame].attrs['category'] == 19:
+                        #     os.makedirs(f"./for_visual", exist_ok=True)
+                        #     save_lidar(point, f"./for_visual/{key}_{box_id}_{j}_point.ply")
+                        #     save_lidar(transformed_point, f"./for_visual/{key}_{box_id}_{j}_transformed_point.ply")
+                        #     print( f"./for_visual/{box_id}_{j}.ply")
+                        past_frames_for_box0.append(past_pc)
+                        past_frames_for_box1.append(past_for_one)
+                    past_frames_for_box0.append(transformed_box_pc0)
+                    past_frames_for_box1.append(box_pc1_frame0_inbox0)
+                    box_data = {
+                        'box_idx': box_idx, #对应pc0的索引 (N,)
+                        'box_pc0': transformed_box_pc0, # (N,3)
+                        'box_p0_dense': torch.cat(past_frames_for_box0).to(torch.float32), # (M1,3)
+                        'box_pc1': torch.cat(past_frames_for_box1).to(torch.float32), # (M2,3)
+                    }
+                    frame_boxes.append(box_data)
+
+                    # if box_group[key].attrs['category'] == 19 and transformed_box_pc0.shape[0] > 500 and box_group[key].attrs['dynamic_status']:
+                    #     os.makedirs(f"./for_visual", exist_ok=True)
+                    #     save_lidar(box_pc0.cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc0.ply")
+                    #     save_lidar(box_pc1.cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc1.ply")
+                    #     save_lidar((box_pc0 + ego_flow_box + flow_restore).cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc0_flow.ply")
+                    #     # save_lidar(box_pc1_frame0_inbox0.cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc1_frame0_inbox0.ply")
+                    #     save_lidar(torch.cat(past_frames_for_box0).cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc0_dense.ply")
+                    #     # save_lidar(transformed_box_pc0.cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc0.ply")
+                    #     save_lidar(torch.cat(past_frames_for_box1).to(torch.float32).cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc1_dense.ply")
+                    #     save_lidar((transformed_box_pc0 + flow_gt_box).cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc0_dense_flow_gt.ply")
+                    #     # save_lidar(box_pc1_frame0_inbox0.cpu().numpy(), f"./for_visual/{key}_{box_id}_{j}_box_pc1.ply")
+
+                #!
+                # for i in range(1, num_past_frames + 1):
+                #     frame_index = index_ - i
+                #     if frame_index < self.scene_id_bounds[scene_id]["min_index"]: 
+                #         frame_index = self.scene_id_bounds[scene_id]["min_index"] 
+
+                #     past_timestamp = str(self.data_index[frame_index][1])
+                #     past_pc = torch.tensor(f[past_timestamp]['lidar'][:])
+                #     past_gm = torch.tensor(f[past_timestamp]['ground_mask'][:])
+                #     past_pose = torch.tensor(f[past_timestamp]['pose'][:])
+
+                #     past_frames.append((past_pc, past_gm, past_pose))
+
+                # for i, (past_pc, past_gm, past_pose) in enumerate(past_frames):
+                #     res_dict[f'pc_m{i+1}'] = past_pc
+                #     res_dict[f'gm_m{i+1}'] = past_gm
+                #     res_dict[f'pose_m{i+1}'] = past_pose
+            res_dict['frame_boxes'] = frame_boxes #! 存储当前帧的box信息
+            if 'flow' in f[key]:
+                flow = torch.tensor(f[key]['flow'][:])
+                flow_is_valid = torch.tensor(f[key]['flow_is_valid'][:]) 
+                flow_category_indices = torch.tensor(f[key]['flow_category_indices'][:]) 
+                res_dict['flow'] = flow
+                res_dict['flow_is_valid'] = flow_is_valid
+                res_dict['flow_category_indices'] = flow_category_indices #原始的category属性
+                flow_category_labeled = map_label(f[key]['flow_category_indices'][:], self.learning_map) 
+                flow_category_labeled_tensor = torch.tensor(flow_category_labeled, dtype=torch.int32)
+                res_dict['flow_category_labeled'] = flow_category_labeled_tensor #映射之后的label
+
+            if 'ego_motion' in f[key]:
+                ego_motion = torch.tensor(f[key]['ego_motion'][:])
+                res_dict['ego_motion'] = ego_motion
+
+            #! eval all
+            # res_dict['eval_mask'] = (~(gm0 | (torch.tensor(f[key]['flow_category_indices'][:]) == 0)))
+            if self.eval_index: 
+                if self.mode == 'val':
+                    eval_mask = torch.tensor(f[key]['eval_mask'][:])
+                    res_dict['eval_mask'] = eval_mask 
+                elif self.mode == 'test':
+                    eval_mask = torch.ones(pc0.shape[0], 1, dtype=torch.bool) 
+                    res_dict['eval_mask'] = eval_mask
+                else:
+                    raise ValueError(f"Invalid mode: {self.mode}. Only 'val' and 'test' are supported.")
+            # save_flag = True
+            # if save_flag:
+            #     os.makedirs(f"./check_eval_mask", exist_ok=True)
+            #     save_lidar(pc0.cpu().numpy(), f"./check_eval_mask/{scene_id}_{timestamp}_pc0.ply")
+            #     save_lidar(pc0[eval_mask[:,0]].cpu().numpy(), f"./check_eval_mask/{scene_id}_{timestamp}_pc0_mask.ply")
+                
+        return res_dict
+
+
+
+
+
+
+
+
+
 def collate_fn_pad(batch):
 
     num_frames = 2
